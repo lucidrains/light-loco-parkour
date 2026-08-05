@@ -1,3 +1,4 @@
+<img src="./fig2.png" width="400px"></img>
 
 ## Light Loco Parkour - (wip)
 
