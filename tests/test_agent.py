@@ -23,4 +23,4 @@ def test_agent():
     assert pred_actions.shape == (1, 3, 21, 2)
     assert values.shape == (1, 3)
 
-    aux_loss.backward()
+    aux_loss.sum().backward()

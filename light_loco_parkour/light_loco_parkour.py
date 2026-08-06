@@ -151,7 +151,7 @@ class Actor(Module):
 
         aux_decoder_pred = aux_decoder(embed)
 
-        aux_loss = F.mse_loss(aux_decoder_pred, aux_decoder_target)
+        aux_loss = F.mse_loss(aux_decoder_pred, aux_decoder_target, reduction = 'none')
 
         return output, aux_loss
 
