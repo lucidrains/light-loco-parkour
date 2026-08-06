@@ -1,6 +1,6 @@
 [project]
 name = "light-loco-parkour"
-version = "0.0.1"
+version = "0.0.2"
 description = "Implementation of Light Loco Parkour, Versatile Perceptive Whole-Body Locomotion via Multi-Skill Distillation, out of Light Origins Labs"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }

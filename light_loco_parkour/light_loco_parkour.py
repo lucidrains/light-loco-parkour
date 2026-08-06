@@ -125,7 +125,9 @@ class Actor(Module):
     def forward(
         self,
         states: Sequence[Tensor],
-        time_hiddens = None
+        time_hiddens = None,
+        aux_decoder: Module | None = None,
+        aux_decoder_target: Tenspr | None = None
     ):
 
         time_encoded_states, next_time_hiddens = self.state_encoder(states, time_hiddens)
@@ -138,7 +140,20 @@ class Actor(Module):
 
         action_dist = self.to_actions(embed)
 
-        return action_dist, next_time_hiddens
+        output = (action_dist, next_time_hiddens)
+
+        # maybe aux decoder for student
+
+        assert xnor(exists(aux_decoder), exists(aux_decoder_target))
+
+        if not exists(aux_decoder):
+            return output
+
+        aux_decoder_pred = aux_decoder(embed)
+
+        aux_loss = F.mse_loss(aux_decoder_pred, aux_decoder_target)
+
+        return output, aux_loss
 
 # critic
 
