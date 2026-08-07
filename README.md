@@ -14,3 +14,17 @@ Implementation of [Light Loco Parkour](https://light-loco-parkour.github.io/), V
     url     = {https://light-loco-parkour.github.io/}
 }
 ```
+
+```bibtex
+@article{zhao2025knowledge,
+    author  = {Zhao, Rui and Fan, Yuze and Li, Yun and Zhang, Dong and Gao, Fei and Gao, Zhenhai and Yang, Zhengcai},
+    title   = {Knowledge Distillation-Enhanced Behavior Transformer for Decision-Making of Autonomous Driving},
+    journal = {Sensors},
+    year    = {2025},
+    volume  = {25},
+    number  = {1},
+    pages   = {191},
+    doi     = {10.3390/s25010191},
+    url     = {https://www.mdpi.com/1424-8220/25/1/191}
+}
+```

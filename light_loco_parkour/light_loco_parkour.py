@@ -18,6 +18,8 @@ from torch_einops_utils import (
 
 from x_mlps_pytorch import create_mlp
 
+from torch.distributions import Distribution, Normal, Beta as _Beta
+
 # helper functions
 
 def exists(v):
@@ -28,6 +30,113 @@ def default(v, d):
 
 def xnor(x, y):
     return x == y
+
+# action distributions
+
+class Gaussian(Module):
+    def __init__(
+        self,
+        param_type = 'log_std',
+        pos_fn = 'exp',
+        min_std = 1e-5,
+        raw_bounds = (-20, 2)
+    ):
+        super().__init__()
+        assert param_type in ('log_std', 'log_var')
+        assert pos_fn in ('exp', 'softplus')
+
+        self.param_type = param_type
+        self.pos_fn = pos_fn
+        self.min_std = min_std
+        self.raw_bounds = raw_bounds
+
+    def mean(self, params):
+        return params[..., 0]
+
+    def log_prob(
+        self,
+        params_or_dist,
+        action,
+        sum_action_dim = True
+    ):
+        dist = params_or_dist if isinstance(params_or_dist, Distribution) else self(params_or_dist)
+        log_prob = dist.log_prob(action)
+        return log_prob.sum(dim = -1) if sum_action_dim else log_prob
+
+    def forward(self, params):
+        pos_fn = self.pos_fn
+        mean, raw = params.unbind(dim = -1)
+
+        # maybe clamp raw parameters to bounds
+
+        if exists(self.raw_bounds):
+            min_val, max_val = self.raw_bounds
+            raw = raw.clamp(min = min_val, max = max_val)
+
+        # positive activation function
+
+        if pos_fn == 'exp':
+            pos = raw.exp()
+        elif pos_fn == 'softplus':
+            pos = F.softplus(raw)
+
+        # derive standard deviation
+
+        if self.param_type == 'log_std':
+            std = pos.clamp(min = self.min_std)
+        elif self.param_type == 'log_var':
+            std = pos.clamp(min = self.min_std ** 2).sqrt()
+
+        return Normal(mean, std)
+
+# beta distribution policy - mean-concentration reparameterization
+
+class Beta(Module):
+    def __init__(
+        self,
+        pos_fn = 'softplus'
+    ):
+        super().__init__()
+        assert pos_fn in ('exp', 'softplus')
+        self.pos_fn = pos_fn
+
+    def mean(self, params):
+        raw_mean = params[..., 0]
+        return raw_mean.sigmoid()
+
+    def log_prob(
+        self,
+        params_or_dist,
+        action,
+        sum_action_dim = True,
+        eps = 1e-5
+    ):
+        action = action.clamp(min = eps, max = 1. - eps)
+        dist = params_or_dist if isinstance(params_or_dist, Distribution) else self(params_or_dist)
+        log_prob = dist.log_prob(action)
+        return log_prob.sum(dim = -1) if sum_action_dim else log_prob
+
+    def forward(self, params):
+        pos_fn = self.pos_fn
+        raw_mean, raw_conc = params.unbind(dim = -1)
+
+        # mean mapped to (0, 1)
+
+        mean = raw_mean.sigmoid()
+
+        # transform to positive concentration + 2 (unimodal)
+
+        if pos_fn == 'softplus':
+            conc = F.softplus(raw_conc) + 2.
+        elif pos_fn == 'exp':
+            conc = raw_conc.exp() + 2.
+
+        # convert beta distribution
+
+        alpha = mean * conc
+        beta = (1. - mean) * conc
+
+        return _Beta(alpha, beta)
 
 # one hot helper module
 
@@ -152,6 +261,9 @@ class Actor(Module):
         num_skill_groups = 1,
         depth = 4,
         num_actions = 21,
+        distr: Module | None = None,
+        action_distr: Module | None = None,
+        distr_dim_out = 2
     ):
         super().__init__()
         self.state_encoder = state_encoder
@@ -160,10 +272,14 @@ class Actor(Module):
 
         self.backbone = create_mlp(dim, dim_in = self.skill_cond.dim_cond + dim, depth = depth)
 
+        action_distr = default(action_distr, distr)
+        self.action_distr = action_distr
+        self.distr_dim_out = distr_dim_out
+
         self.to_actions = nn.Sequential(
             RMSNorm(dim),
-            Linear(dim, num_actions * 2),
-            Rearrange('... (d distr_params) -> ... d distr_params', distr_params = 2)
+            Linear(dim, num_actions * distr_dim_out),
+            Rearrange('... (d distr_params) -> ... d distr_params', distr_params = distr_dim_out)
         )
 
     def forward(
@@ -171,6 +287,10 @@ class Actor(Module):
         states: Sequence[Tensor],
         time_hiddens = None,
         skill_groups = None,
+        deterministic = False,
+        return_action_distr = False,
+        sample_action = False,
+        return_log_prob = False,
         aux_decoder: Module | None = None,
         aux_decoder_target: Tensor | None = None
     ):
@@ -191,11 +311,37 @@ class Actor(Module):
 
         embed = self.backbone(time_encoded_states)
 
-        # prediction actions
+        # predict actions
 
-        action_dist = self.to_actions(embed)
+        params = self.to_actions(embed)
 
-        output = (action_dist, next_time_hiddens)
+        action_distr = self.action_distr
+
+        # handle action outputs (deterministic, sampling with optional log_prob, or distribution)
+
+        if deterministic:
+            action_out = action_distr.mean(params) if exists(action_distr) else params[..., 0]
+            output = (action_out, next_time_hiddens)
+
+        elif sample_action or return_log_prob:
+            assert exists(action_distr), 'action_distr must be passed to Actor to sample actions'
+            dist = action_distr(params)
+            action = dist.sample()
+
+            if return_log_prob:
+                log_prob = action_distr.log_prob(dist, action)
+                output = (action, log_prob, next_time_hiddens)
+            else:
+                output = (action, next_time_hiddens)
+
+        elif return_action_distr:
+            assert exists(action_distr), 'action_distr must be passed to Actor to return action distribution'
+            dist = action_distr(params)
+            output = (dist, next_time_hiddens)
+
+        else:
+            action_out = action_distr(params) if exists(action_distr) else params
+            output = (action_out, next_time_hiddens)
 
         # maybe aux decoder for student
 
