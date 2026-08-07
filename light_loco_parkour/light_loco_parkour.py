@@ -29,6 +29,47 @@ def default(v, d):
 def xnor(x, y):
     return x == y
 
+# one hot helper module
+
+class OneHot(Module):
+    def __init__(
+        self,
+        num_classes = 1
+    ):
+        super().__init__()
+        self.num_classes = num_classes
+        self.dim_cond = 0 if num_classes <= 1 else num_classes
+        self.register_buffer('dummy', torch.empty(0), persistent = False)
+
+    @property
+    def device(self):
+        return self.dummy.device
+
+    def forward(
+        self,
+        category: int | Tensor | None,
+        batch_size: int | None = None,
+        time_steps: int | None = None
+    ):
+        num_classes = self.num_classes
+
+        if self.dim_cond == 0 or not exists(category):
+            return None
+
+        # handle 0d (int / scalar tensor) - expand across batch and time
+
+        if isinstance(category, int) or (is_tensor(category) and category.ndim == 0):
+            assert exists(batch_size) and exists(time_steps), 'batch_size and time_steps must be provided for scalar category'
+            category = torch.full((batch_size, time_steps), category, dtype = torch.long, device = self.device)
+
+        # handle 1d (batch,) - expand across time
+
+        elif is_tensor(category) and category.ndim == 1:
+            assert exists(time_steps), 'time_steps must be provided for 1d category tensor (batch)'
+            category = repeat(category, 'b -> b t', t = time_steps)
+
+        return F.one_hot(category, num_classes).float()
+
 # state encoder
 
 class StateEncoder(Module):
@@ -108,13 +149,16 @@ class Actor(Module):
         dim,
         *,
         state_encoder: StateEncoder,
+        num_skill_groups = 1,
         depth = 4,
         num_actions = 21,
     ):
         super().__init__()
         self.state_encoder = state_encoder
 
-        self.backbone = create_mlp(dim, depth = 4)
+        self.skill_cond = OneHot(num_skill_groups)
+
+        self.backbone = create_mlp(dim, dim_in = self.skill_cond.dim_cond + dim, depth = depth)
 
         self.to_actions = nn.Sequential(
             RMSNorm(dim),
@@ -126,11 +170,22 @@ class Actor(Module):
         self,
         states: Sequence[Tensor],
         time_hiddens = None,
+        skill_groups = None,
         aux_decoder: Module | None = None,
-        aux_decoder_target: Tenspr | None = None
+        aux_decoder_target: Tensor | None = None
     ):
 
         time_encoded_states, next_time_hiddens = self.state_encoder(states, time_hiddens)
+
+        batch, time = time_encoded_states.shape[:2]
+
+        maybe_one_hot = self.skill_cond(
+            skill_groups,
+            batch_size = batch,
+            time_steps = time
+        )
+
+        time_encoded_states = safe_cat((time_encoded_states, maybe_one_hot), dim = -1)
 
         # backbone
 
@@ -169,10 +224,9 @@ class Critic(Module):
         super().__init__()
         self.state_encoder = state_encoder
 
-        self.num_skill_groups = num_skill_groups
-        dim_cond = 0 if num_skill_groups <= 1 else num_skill_groups
+        self.skill_cond = OneHot(num_skill_groups)
 
-        self.backbone = create_mlp(dim, dim_in = dim_cond + dim, depth = depth)
+        self.backbone = create_mlp(dim, dim_in = self.skill_cond.dim_cond + dim, depth = depth)
 
         self.to_value_pred = Linear(dim, 1, bias = False)
 
@@ -180,25 +234,19 @@ class Critic(Module):
         self,
         states: Sequence[Tensor],
         time_hiddens = None,
-        skill_groups = None # int[b]
+        skill_groups = None # int | Tensor
     ):
-        num_skill_groups = self.num_skill_groups
-
         time_encoded_states, next_time_hiddens = self.state_encoder(states, time_hiddens)
 
-        # take care of the skill group conditioning
+        batch, time = time_encoded_states.shape[:2]
 
-        assert xnor(exists(skill_groups), num_skill_groups > 1)
+        maybe_one_hot = self.skill_cond(
+            skill_groups,
+            batch_size = batch,
+            time_steps = time
+        )
 
-        if num_skill_groups > 1:
-            batch, time = time_encoded_states.shape[:2]
-
-            if skill_groups.ndim == 0:
-                skill_groups = repeat(skill_groups, ' -> b', b = batch)
-
-            num_skill_groups = F.one_hot(skill_groups, num_skill_groups)
-            num_skill_groups = repeat(num_skill_groups, 'b g -> b t g', t = time)
-            time_encoded_states = cat((time_encoded_states, num_skill_groups), dim = -1)
+        time_encoded_states = safe_cat((time_encoded_states, maybe_one_hot), dim = -1)
 
         # backbone
 
