@@ -76,3 +76,68 @@ def test_action_distributions(distr_cls, param_type, pos_fn):
     assert log_prob.shape == (2, 3)
 
     (mean_actions.sum() + log_prob.sum()).backward()
+
+@param('has_aux_decoder', [False, True])
+def test_distillation_wrapper(has_aux_decoder):
+    from light_loco_parkour import DistillationWrapper, Agent
+
+    aux_decoder = create_mlp(10, dim_in = 512, depth = 2) if has_aux_decoder else None
+
+    student_encoder = StateEncoder(512, dim_state = 4 + 5)
+    teacher_encoder = StateEncoder(512, dim_state = 4 + 5 + 10)
+
+    student_actor = Actor(512, state_encoder = student_encoder, aux_decoder = aux_decoder)
+    teacher_actor = Actor(512, state_encoder = teacher_encoder, num_skill_groups = 2)
+    critic = Critic(512, state_encoder = teacher_encoder, num_skill_groups = 2)
+
+    distill_kwargs = dict(
+        student_state_keys = ('images', 'proprio'),
+        teacher_state_keys = ('images', 'proprio', 'privileged_info')
+    )
+
+    if has_aux_decoder:
+        distill_kwargs.update(
+            privileged_state_key = 'privileged_info',
+            aux_loss_weight = 0.5
+        )
+
+    distill = DistillationWrapper(student_actor, teacher_actor, **distill_kwargs)
+
+    states = dict(
+        images = torch.randn(2, 3, 2, 2),
+        proprio = torch.randn(2, 3, 5),
+        privileged_info = torch.randn(2, 3, 10)
+    )
+
+    # reduced loss
+
+    loss = distill(states, teacher_skill_groups = 1)
+    assert loss.ndim == 0
+    loss.backward()
+
+    # unreduced loss
+
+    unreduced_loss = distill(states, teacher_skill_groups = 1, return_unreduced = True)
+
+    if has_aux_decoder:
+        assert unreduced_loss.shape == (2, 3)
+    else:
+        assert unreduced_loss.shape == (2, 3, 21)
+
+    # loss breakdown
+
+    total_loss, (distill_loss, aux_loss) = distill(states, teacher_skill_groups = 1, return_loss_breakdown = True)
+    assert total_loss.ndim == 0
+    assert distill_loss.ndim == 0
+
+    # soft weighting
+
+    weights = torch.rand(2, 3)
+    weighted_loss = distill(states, weights = weights, teacher_skill_groups = 1)
+    assert weighted_loss.ndim == 0
+
+    # variable length sequence support
+
+    lens = tensor([2, 3])
+    var_len_loss = distill(states, lens = lens, teacher_skill_groups = 1)
+    assert var_len_loss.ndim == 0

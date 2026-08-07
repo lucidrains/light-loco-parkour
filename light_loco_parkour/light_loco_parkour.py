@@ -1,17 +1,22 @@
 from __future__ import annotations
 from typing import Sequence
+from beartype import beartype
+from contextlib import nullcontext
 
 import torch
-from torch import nn, cat, stack, is_tensor, Tensor
-from torch.nn import Module, ModuleList, Linear, RMSNorm
+from torch import nn, cat, stack, is_tensor, tensor, Tensor
+from torch.nn import Module, Linear, RMSNorm
 import torch.nn.functional as F
 
-from einops import rearrange, repeat
+import einx
+from einops import rearrange, repeat, reduce
 from einops.layers.torch import Rearrange
 
 from torch_einops_utils import (
     pad_left_at_dim,
-    tree_map_tensor,
+    pad_right_ndim_to,
+    lens_to_mask,
+    masked_mean,
     pack_with_inverse,
     safe_cat
 )
@@ -30,6 +35,12 @@ def default(v, d):
 
 def xnor(x, y):
     return x == y
+
+def cast_tuple(v, length = 1):
+    return v if isinstance(v, tuple) else (v,) * length
+
+def pluck(d, keys):
+    return [d[k] for k in keys]
 
 # action distributions
 
@@ -148,7 +159,7 @@ class OneHot(Module):
         super().__init__()
         self.num_classes = num_classes
         self.dim_cond = 0 if num_classes <= 1 else num_classes
-        self.register_buffer('dummy', torch.empty(0), persistent = False)
+        self.register_buffer('dummy', tensor(0), persistent = False)
 
     @property
     def device(self):
@@ -263,7 +274,8 @@ class Actor(Module):
         num_actions = 21,
         distr: Module | None = None,
         action_distr: Module | None = None,
-        distr_dim_out = 2
+        distr_dim_out = 2,
+        aux_decoder: Module | None = None
     ):
         super().__init__()
         self.state_encoder = state_encoder
@@ -275,6 +287,8 @@ class Actor(Module):
         action_distr = default(action_distr, distr)
         self.action_distr = action_distr
         self.distr_dim_out = distr_dim_out
+
+        self.aux_decoder = aux_decoder
 
         self.to_actions = nn.Sequential(
             RMSNorm(dim),
@@ -294,6 +308,7 @@ class Actor(Module):
         aux_decoder: Module | None = None,
         aux_decoder_target: Tensor | None = None
     ):
+        aux_decoder = default(aux_decoder, self.aux_decoder)
 
         time_encoded_states, next_time_hiddens = self.state_encoder(states, time_hiddens)
 
@@ -420,6 +435,147 @@ class Agent(Module):
         self.student_actor = student_actor
         self.teacher_actor = teacher_actor
         self.critic = critic
+
+# distillation wrapper
+
+class DistillationWrapper(Module):
+    @beartype
+    def __init__(
+        self,
+        student: Module,
+        teacher: Module,
+        *,
+        student_state_keys: tuple[str, ...],
+        teacher_state_keys: tuple[str, ...],
+        aux_decoder: Module | None = None,
+        privileged_state_key: str | tuple[str, ...] | None = None,
+        aux_loss_weight = 1.0,
+        detach_teacher = True
+    ):
+
+        super().__init__()
+        self.student = student
+        self.teacher = teacher
+
+        self.student_state_keys = student_state_keys
+        self.teacher_state_keys = teacher_state_keys
+
+        self.aux_decoder = aux_decoder
+        self.privileged_state_key = privileged_state_key
+        self.aux_loss_weight = aux_loss_weight
+
+        self.teacher_context = torch.no_grad if detach_teacher else nullcontext
+
+        self.register_buffer('zero', tensor(0.), persistent = False)
+
+    def forward(
+        self,
+        states: dict[str, Tensor],
+        weights: Tensor | None = None,
+        lens: Tensor | None = None,
+        mask: Tensor | None = None,
+        teacher_skill_groups = None,
+        student_time_hiddens = None,
+        teacher_time_hiddens = None,
+        aux_decoder: Module | None = None,
+        aux_decoder_target: Tensor | None = None,
+        return_unreduced = False,
+        return_loss_breakdown = False
+    ):
+
+        student_states = pluck(states, self.student_state_keys)
+        teacher_states = pluck(states, self.teacher_state_keys)
+
+        # resolve mask from lens if provided
+
+        if exists(lens) and not exists(mask):
+            time_steps = student_states[0].shape[1]
+            mask = lens_to_mask(lens, max_len = time_steps)
+
+        # resolve aux decoder and target
+
+        aux_decoder = default(aux_decoder, self.aux_decoder)
+        aux_decoder = default(aux_decoder, self.student.aux_decoder)
+
+        if not exists(aux_decoder_target) and exists(self.privileged_state_key):
+            privileged_keys = cast_tuple(self.privileged_state_key)
+            aux_decoder_target = safe_cat(pluck(states, privileged_keys), dim = -1)
+
+        # forward student
+
+        student_kwargs = dict(
+            time_hiddens = student_time_hiddens,
+            deterministic = True
+        )
+
+        has_aux = exists(aux_decoder) and exists(aux_decoder_target)
+
+        if has_aux:
+            student_kwargs.update(
+                aux_decoder = aux_decoder,
+                aux_decoder_target = aux_decoder_target
+            )
+
+        student_out = self.student(student_states, **student_kwargs)
+
+        aux_loss = self.zero
+        if has_aux:
+            student_out, aux_loss = student_out
+
+        student_mean, _ = student_out
+
+        # forward teacher
+
+        with self.teacher_context():
+            teacher_mean, _ = self.teacher(
+                teacher_states,
+                time_hiddens = teacher_time_hiddens,
+                skill_groups = teacher_skill_groups,
+                deterministic = True
+            )
+
+        # compute distillation mse loss
+
+        distill_loss = F.mse_loss(student_mean, teacher_mean, reduction = 'none')
+
+        # maybe combine with aux loss
+
+        if has_aux:
+            aux_loss = reduce(aux_loss, '... d -> ...', 'mean') * self.aux_loss_weight
+            distill_loss = reduce(distill_loss, '... d -> ...', 'mean')
+
+        loss = distill_loss + aux_loss
+
+        # maybe weight loss
+
+        if exists(weights):
+            loss = loss * pad_right_ndim_to(weights, loss.ndim)
+            distill_loss = distill_loss * pad_right_ndim_to(weights, distill_loss.ndim)
+            if has_aux:
+                aux_loss = aux_loss * pad_right_ndim_to(weights, aux_loss.ndim)
+
+        # maybe mask unreduced loss
+
+        if exists(mask) and return_unreduced:
+            loss = einx.where('b t, b t ..., -> b t ...', mask, loss, 0.)
+            distill_loss = einx.where('b t, b t ..., -> b t ...', mask, distill_loss, 0.)
+            if has_aux:
+                aux_loss = einx.where('b t, b t ..., -> b t ...', mask, aux_loss, 0.)
+
+        # return
+
+        if not return_unreduced:
+            loss = masked_mean(loss, mask)
+            distill_loss = masked_mean(distill_loss, mask)
+            if has_aux:
+                aux_loss = masked_mean(aux_loss, mask)
+
+        if not return_loss_breakdown:
+            return loss
+
+        loss_breakdown = (distill_loss, aux_loss)
+
+        return loss, loss_breakdown
 
 # training wrapper
 
