@@ -21,7 +21,7 @@ from torch_einops_utils import (
     safe_cat
 )
 
-from x_mlps_pytorch import create_mlp
+from x_mlps_pytorch import create_mlp, create_filmable_mlp
 
 from torch.distributions import Distribution, Normal, Beta as _Beta
 
@@ -198,19 +198,33 @@ class StateEncoder(Module):
         dim,
         *,
         dim_state,
+        cond_key: int | str | None = None,
+        dim_cond: int | None = None,
         num_stacked_frames = 5,
         tbptt_timesteps = 10,
         use_rnn = False
     ):
         super().__init__()
 
+        is_filmable = exists(cond_key) or exists(dim_cond)
+        assert not is_filmable or (exists(cond_key) and exists(dim_cond)), 'both cond_key and dim_cond must be provided if film conditioning is enabled'
+
         self.num_stacked_frames = num_stacked_frames
         self.use_rnn = use_rnn
 
+        self.cond_key = cond_key
+        self.dim_cond = dim_cond
+        self.is_filmable = is_filmable
+
         dim_state_total = dim_state * num_stacked_frames
 
-        self.mlp_encoder = create_mlp(dim, dim_in = dim_state_total, depth = 2)
+        create_mlp_fn = create_filmable_mlp if is_filmable else create_mlp
 
+        mlp_kwargs = dict()
+        if is_filmable:
+            mlp_kwargs.update(cond_dim = dim_cond * num_stacked_frames)
+
+        self.mlp_encoder = create_mlp_fn(dim, depth = 2, dim_in = dim_state_total, **mlp_kwargs)
         self.rnn = nn.GRU(dim, dim, batch_first = True) if use_rnn else None
 
         self.tbptt_timesteps = tbptt_timesteps
@@ -218,26 +232,44 @@ class StateEncoder(Module):
 
     def forward(
         self,
-        states: Sequence[Tensor], # [b t ...]
+        states: Sequence[Tensor] | dict[str, Tensor] | Tensor, # [b t ...]
         time_hiddens = None
     ):
         frames, tbptt_timesteps = self.num_stacked_frames, self.tbptt_timesteps
 
-        # they simply pack all the states and use an MLP - they tried a conv encoder for the 2d depth map but saw no benefits
+        def stack_frames(state_inputs):
+            packed, _ = pack_with_inverse(state_inputs, 'b t *')
+            padded = pad_left_at_dim(packed, frames - 1, dim = 1)
+            stacked = padded.unfold(1, frames, 1)
+            return rearrange(stacked, 'b t ... -> b t (...)')
 
-        states, _ = pack_with_inverse(states, 'b t *')
+        # maybe film conditioning with proprioception
 
-        # pad for the unfolding to get the stacked frames - first timestep will have 4 padded frames, second have 3, so on
+        mlp_kwargs = dict()
 
-        padded_states = pad_left_at_dim(states, frames - 1, dim = 1)
+        if self.is_filmable:
+            cond_key = self.cond_key
+            if isinstance(cond_key, int) and isinstance(states, Sequence):
+                states = list(states)
+                cond_state = states.pop(cond_key)
+            elif isinstance(cond_key, str) and isinstance(states, dict):
+                states = dict(states)
+                cond_state = states.pop(cond_key)
+            else:
+                raise ValueError(f'states must be a Sequence when cond_key is int, or a dict when cond_key is str (got {type(states)})')
 
-        stacked_states = padded_states.unfold(1, frames, 1)
+            mlp_kwargs.update(cond = stack_frames(cond_state))
 
-        stacked_states = rearrange(stacked_states, 'b t ... -> b t (...)')
+        # dict to list of tensors
 
-        # encode the states
+        if isinstance(states, dict):
+            states = list(states.values())
 
-        encoded_state = self.mlp_encoder(stacked_states)
+        # stack the states and encode them
+
+        stacked_states = stack_frames(states)
+
+        encoded_state = self.mlp_encoder(stacked_states, **mlp_kwargs)
 
         if not self.use_rnn:
             return encoded_state, None

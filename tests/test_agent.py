@@ -201,3 +201,36 @@ def test_cascading_distillation():
 
     assert loss_stage2.ndim == 0
     loss_stage2.backward()
+
+@param('use_dict', [True, False])
+def test_film_proprioception_conditioning(use_dict):
+    dim_proprio = 5
+    dim_depth = 12
+
+    if use_dict:
+        cond_key = 'proprio'
+        states = dict(
+            depth = torch.randn(2, 3, 12),
+            proprio = torch.randn(2, 3, 5)
+        )
+    else:
+        cond_key = 1
+        states = (
+            torch.randn(2, 3, 12), # depth at index 0
+            torch.randn(2, 3, 5)   # proprio at index 1
+        )
+
+    encoder = StateEncoder(
+        512,
+        dim_state = dim_depth,
+        cond_key = cond_key,
+        dim_cond = dim_proprio,
+        use_rnn = True
+    )
+
+    actor = Actor(512, state_encoder = encoder)
+
+    action_out, next_hidden = actor(states)
+
+    assert action_out.shape == (2, 3, 21, 2)
+    action_out.sum().backward()
