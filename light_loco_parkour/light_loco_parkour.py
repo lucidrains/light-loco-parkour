@@ -475,6 +475,7 @@ class DistillationWrapper(Module):
         lens: Tensor | None = None,
         mask: Tensor | None = None,
         teacher_skill_groups = None,
+        student_skill_groups = None,
         student_time_hiddens = None,
         teacher_time_hiddens = None,
         aux_decoder: Module | None = None,
@@ -505,6 +506,7 @@ class DistillationWrapper(Module):
 
         student_kwargs = dict(
             time_hiddens = student_time_hiddens,
+            skill_groups = student_skill_groups,
             deterministic = True
         )
 

@@ -141,3 +141,63 @@ def test_distillation_wrapper(has_aux_decoder):
     lens = tensor([2, 3])
     var_len_loss = distill(states, lens = lens, teacher_skill_groups = 1)
     assert var_len_loss.ndim == 0
+
+def test_cascading_distillation():
+    from light_loco_parkour import DistillationWrapper
+
+    # 3 networks in a hierarchy with cascading privileged information:
+    # top-most teacher (highest privilege: images, proprio, depth, scan) -> mid teacher (mid privilege: images, proprio, depth) -> final student (lowest privilege: images, proprio)
+
+    top_teacher_encoder = StateEncoder(512, dim_state = 4 + 5 + 10 + 8)
+    mid_teacher_encoder = StateEncoder(512, dim_state = 4 + 5 + 10)
+    student_encoder = StateEncoder(512, dim_state = 4 + 5)
+
+    top_teacher_actor = Actor(512, state_encoder = top_teacher_encoder, num_skill_groups = 3)
+    mid_teacher_actor = Actor(512, state_encoder = mid_teacher_encoder, num_skill_groups = 2)
+    student_actor = Actor(512, state_encoder = student_encoder)
+
+    # first distillation stage: top teacher -> mid teacher
+
+    distill_top_to_mid = DistillationWrapper(
+        student = mid_teacher_actor,
+        teacher = top_teacher_actor,
+        student_state_keys = ('images', 'proprio', 'depth'),
+        teacher_state_keys = ('images', 'proprio', 'depth', 'scan')
+    )
+
+    # second distillation stage: mid teacher -> student
+
+    distill_mid_to_student = DistillationWrapper(
+        student = student_actor,
+        teacher = mid_teacher_actor,
+        student_state_keys = ('images', 'proprio'),
+        teacher_state_keys = ('images', 'proprio', 'depth')
+    )
+
+    states = dict(
+        images = torch.randn(2, 3, 2, 2),
+        proprio = torch.randn(2, 3, 5),
+        depth = torch.randn(2, 3, 10),
+        scan = torch.randn(2, 3, 8)
+    )
+
+    # stage 1 loss (top -> mid)
+
+    loss_stage1 = distill_top_to_mid(
+        states,
+        student_skill_groups = 1,
+        teacher_skill_groups = 2
+    )
+
+    assert loss_stage1.ndim == 0
+    loss_stage1.backward()
+
+    # stage 2 loss (mid -> student)
+
+    loss_stage2 = distill_mid_to_student(
+        states,
+        teacher_skill_groups = 1
+    )
+
+    assert loss_stage2.ndim == 0
+    loss_stage2.backward()
