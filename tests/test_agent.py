@@ -234,3 +234,46 @@ def test_film_proprioception_conditioning(use_dict):
 
     assert action_out.shape == (2, 3, 21, 2)
     action_out.sum().backward()
+
+@param('use_dict', [True, False])
+def test_agent_routing(use_dict):
+    from light_loco_parkour import Agent
+
+    actor_encoder = StateEncoder(512, dim_state = 4 + 5)
+    critic_encoder = StateEncoder(512, dim_state = 4 + 5 + 10)
+
+    actor = Actor(512, state_encoder = actor_encoder)
+    critic = Critic(512, state_encoder = critic_encoder)
+
+    if use_dict:
+        actor_state_keys = ('images', 'proprio')
+        critic_state_keys = ('images', 'proprio', 'privileged_info')
+        states = dict(
+            images = torch.randn(2, 3, 2, 2),
+            proprio = torch.randn(2, 3, 5),
+            privileged_info = torch.randn(2, 3, 10),
+            unused_sensor = torch.randn(2, 3, 16)
+        )
+    else:
+        actor_state_keys = (0, 1)
+        critic_state_keys = (0, 1, 2)
+        states = (
+            torch.randn(2, 3, 2, 2),
+            torch.randn(2, 3, 5),
+            torch.randn(2, 3, 10),
+            torch.randn(2, 3, 16)
+        )
+
+    agent = Agent(
+        actor,
+        critic,
+        actor_state_keys = actor_state_keys,
+        critic_state_keys = critic_state_keys
+    )
+
+    (actions, _), (values, _) = agent(states)
+
+    assert actions.shape == (2, 3, 21, 2)
+    assert values.shape == (2, 3)
+
+    (actions.sum() + values.sum()).backward()

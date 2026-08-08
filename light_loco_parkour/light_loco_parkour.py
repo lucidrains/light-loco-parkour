@@ -459,20 +459,36 @@ class Critic(Module):
 
         return values, next_time_hiddens
 
-# classes
+# agent
 
 class Agent(Module):
     def __init__(
         self,
-        student_actor: Module,
-        teacher_actor: Module,
-        critic: Module
+        actor: Module,
+        critic: Module,
+        *,
+        actor_state_keys: tuple[str, ...] | None = None,
+        critic_state_keys: tuple[str, ...] | None = None
     ):
         super().__init__()
-
-        self.student_actor = student_actor
-        self.teacher_actor = teacher_actor
+        self.actor = actor
         self.critic = critic
+
+        self.actor_state_keys = actor_state_keys
+        self.critic_state_keys = critic_state_keys
+
+    def forward(
+        self,
+        states: dict[str, Tensor] | Sequence[Tensor] | Tensor,
+        **kwargs
+    ):
+        actor_states = pluck(states, self.actor_state_keys) if exists(self.actor_state_keys) else states
+        critic_states = pluck(states, self.critic_state_keys) if exists(self.critic_state_keys) else states
+
+        actor_out = self.actor(actor_states, **kwargs)
+        critic_out = self.critic(critic_states)
+
+        return actor_out, critic_out
 
 # distillation wrapper
 
