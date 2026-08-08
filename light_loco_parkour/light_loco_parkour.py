@@ -20,6 +20,7 @@ from torch_einops_utils import (
     pack_with_inverse,
     safe_cat
 )
+from torch_einops_utils.shape import shape, is_shape
 
 from x_mlps_pytorch import create_mlp, create_filmable_mlp
 
@@ -184,7 +185,7 @@ class OneHot(Module):
 
         # handle 1d (batch,) - expand across time
 
-        elif is_tensor(category) and category.ndim == 1:
+        elif is_tensor(category) and is_shape(category, 'b'):
             assert exists(time_steps), 'time_steps must be provided for 1d category tensor (batch)'
             category = repeat(category, 'b -> b t', t = time_steps)
 
@@ -349,7 +350,7 @@ class Actor(Module):
 
         time_encoded_states, next_time_hiddens = self.state_encoder(states, time_hiddens)
 
-        batch, time = time_encoded_states.shape[:2]
+        batch, time, _ = shape(time_encoded_states, 'b t ...')
 
         maybe_one_hot = self.skill_cond(
             skill_groups,
@@ -436,7 +437,7 @@ class Critic(Module):
     ):
         time_encoded_states, next_time_hiddens = self.state_encoder(states, time_hiddens)
 
-        batch, time = time_encoded_states.shape[:2]
+        batch, time, _ = shape(time_encoded_states, 'b t ...')
 
         maybe_one_hot = self.skill_cond(
             skill_groups,
@@ -527,7 +528,7 @@ class DistillationWrapper(Module):
         # resolve mask from lens if provided
 
         if exists(lens) and not exists(mask):
-            time_steps = student_states[0].shape[1]
+            time_steps = shape(student_states[0], 'b t ...').t
             mask = lens_to_mask(lens, max_len = time_steps)
 
         # resolve aux decoder and target
