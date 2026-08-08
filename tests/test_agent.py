@@ -13,7 +13,7 @@ from light_loco_parkour.light_loco_parkour import Actor, Critic, StateEncoder, G
     tensor([1])
 ])
 def test_agent(skill_groups):
-    student_actor = Actor(512, state_encoder = StateEncoder(512, dim_state = 4 + 5))
+    student_actor = Actor(512, state_encoder = StateEncoder(512, dim_state = 4 + 5, use_rnn = True))
     teacher_actor = Actor(512, state_encoder = StateEncoder(512, dim_state = 4 + 5), num_skill_groups = 2, action_distr = Gaussian())
 
     critic = Critic(512, state_encoder = StateEncoder(512, dim_state = 4 + 5), num_skill_groups = 2)
@@ -52,7 +52,7 @@ def test_action_distributions(distr_cls, param_type, pos_fn):
 
     actor = Actor(
         512,
-        state_encoder = StateEncoder(512, dim_state = 4 + 5),
+        state_encoder = StateEncoder(512, dim_state = 4 + 5, use_rnn = True),
         action_distr = distr
     )
 
@@ -83,7 +83,7 @@ def test_distillation_wrapper(has_aux_decoder):
 
     aux_decoder = create_mlp(10, dim_in = 512, depth = 2) if has_aux_decoder else None
 
-    student_encoder = StateEncoder(512, dim_state = 4 + 5)
+    student_encoder = StateEncoder(512, dim_state = 4 + 5, use_rnn = True)
     teacher_encoder = StateEncoder(512, dim_state = 4 + 5 + 10)
 
     student_actor = Actor(512, state_encoder = student_encoder, aux_decoder = aux_decoder)
@@ -150,7 +150,7 @@ def test_cascading_distillation():
 
     top_teacher_encoder = StateEncoder(512, dim_state = 4 + 5 + 10 + 8)
     mid_teacher_encoder = StateEncoder(512, dim_state = 4 + 5 + 10)
-    student_encoder = StateEncoder(512, dim_state = 4 + 5)
+    student_encoder = StateEncoder(512, dim_state = 4 + 5, use_rnn = True)
 
     top_teacher_actor = Actor(512, state_encoder = top_teacher_encoder, num_skill_groups = 3)
     mid_teacher_actor = Actor(512, state_encoder = mid_teacher_encoder, num_skill_groups = 2)

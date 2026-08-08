@@ -199,20 +199,22 @@ class StateEncoder(Module):
         *,
         dim_state,
         num_stacked_frames = 5,
-        tbptt_timesteps = 10
+        tbptt_timesteps = 10,
+        use_rnn = False
     ):
         super().__init__()
 
         self.num_stacked_frames = num_stacked_frames
+        self.use_rnn = use_rnn
 
         dim_state_total = dim_state * num_stacked_frames
 
         self.mlp_encoder = create_mlp(dim, dim_in = dim_state_total, depth = 2)
 
-        self.rnn = nn.GRU(dim, dim, batch_first = True)
+        self.rnn = nn.GRU(dim, dim, batch_first = True) if use_rnn else None
 
         self.tbptt_timesteps = tbptt_timesteps
-        self.has_tbptt = tbptt_timesteps > 0
+        self.has_tbptt = tbptt_timesteps > 0 and use_rnn
 
     def forward(
         self,
@@ -236,6 +238,9 @@ class StateEncoder(Module):
         # encode the states
 
         encoded_state = self.mlp_encoder(stacked_states)
+
+        if not self.use_rnn:
+            return encoded_state, None
 
         # maybe truncated backprop through time
 
