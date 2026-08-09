@@ -18,11 +18,14 @@ from torch_einops_utils import (
     lens_to_mask,
     masked_mean,
     pack_with_inverse,
-    safe_cat
+    safe_cat,
+    z_score
 )
 from torch_einops_utils.shape import shape, is_shape
 
 from x_mlps_pytorch import create_mlp, create_filmable_mlp
+
+from hl_gauss_pytorch import HLGaussLayer
 
 from torch.distributions import Distribution, Normal, Beta as _Beta
 
@@ -101,19 +104,37 @@ class Gaussian(Module):
 
         return Normal(mean, std)
 
-# beta distribution policy - mean-concentration reparameterization
+# beta distribution policy - unimodal mean-concentration reparameterization
 
 class Beta(Module):
     def __init__(
         self,
-        pos_fn = 'softplus'
+        pos_fn = 'softplus',
+        init_conc = 10.,
+        eps = 1e-5
     ):
         super().__init__()
         assert pos_fn in ('exp', 'softplus')
         self.pos_fn = pos_fn
+        self.init_conc = init_conc
+        self.eps = eps
 
-    def mean(self, params):
-        raw_mean = params[..., 0]
+    def concentration(
+        self,
+        raw_conc
+    ):
+        raw_conc = raw_conc + self.init_conc
+
+        if self.pos_fn == 'softplus':
+            return F.softplus(raw_conc) + 2.
+        elif self.pos_fn == 'exp':
+            return raw_conc.exp() + 2.
+
+    def mean(
+        self,
+        params
+    ):
+        raw_mean, _ = params.unbind(dim = -1)
         return raw_mean.sigmoid()
 
     def log_prob(
@@ -129,24 +150,27 @@ class Beta(Module):
         return log_prob.sum(dim = -1) if sum_action_dim else log_prob
 
     def forward(self, params):
-        pos_fn = self.pos_fn
         raw_mean, raw_conc = params.unbind(dim = -1)
 
         # mean mapped to (0, 1)
 
         mean = raw_mean.sigmoid()
 
-        # transform to positive concentration + 2 (unimodal)
+        # positive concentration
 
-        if pos_fn == 'softplus':
-            conc = F.softplus(raw_conc) + 2.
-        elif pos_fn == 'exp':
-            conc = raw_conc.exp() + 2.
+        conc = self.concentration(raw_conc)
 
-        # convert beta distribution
+        # concentration floor for unimodality (alpha > 1 and beta > 1)
 
-        alpha = mean * conc
-        beta = (1. - mean) * conc
+        min_mean = torch.minimum(mean, 1. - mean).clamp(min = self.eps)
+        conc_unimodal_floor = 1. / min_mean
+
+        total_conc = conc_unimodal_floor + conc
+
+        # convert to beta distribution with exact mean = mean and alpha, beta > 1
+
+        alpha = mean * total_conc
+        beta = (1. - mean) * total_conc
 
         return _Beta(alpha, beta)
 
@@ -419,6 +443,11 @@ class Critic(Module):
         num_skill_groups = 1,
         state_encoder: StateEncoder,
         depth = 4,
+        use_regression = True,
+        min_value = -1.,
+        max_value = 1.,
+        num_bins = 2,
+        use_symlog = False
     ):
         super().__init__()
         self.state_encoder = state_encoder
@@ -427,13 +456,31 @@ class Critic(Module):
 
         self.backbone = create_mlp(dim, dim_in = self.skill_cond.dim_cond + dim, depth = depth)
 
-        self.to_value_pred = Linear(dim, 1, bias = False)
+        # mse regression or hl gauss value prediction
+
+        hl_gauss_loss = dict(
+            min_value = min_value,
+            max_value = max_value,
+            num_bins = num_bins,
+            use_symlog = use_symlog
+        )
+
+        self.use_regression = use_regression
+
+        self.hl_gauss_layer = HLGaussLayer(
+            dim,
+            use_regression = use_regression,
+            hl_gauss_loss = hl_gauss_loss
+        )
 
     def forward(
         self,
         states: Sequence[Tensor],
         time_hiddens = None,
-        skill_groups = None # int | Tensor
+        skill_groups = None, # int | Tensor
+        target = None, # value targets, if passed a value loss (mse or hl gauss) is returned in place of the values
+        mask = None,
+        return_logits = False
     ):
         time_encoded_states, next_time_hiddens = self.state_encoder(states, time_hiddens)
 
@@ -451,15 +498,13 @@ class Critic(Module):
 
         embed = self.backbone(time_encoded_states)
 
-        # predict values
+        # value prediction (mse regression) or hl gauss classification over value bins
 
-        values = self.to_value_pred(embed)
-
-        values = rearrange(values, '... 1 -> ... ')
+        values = self.hl_gauss_layer(embed, target, mask = mask, return_logits = return_logits)
 
         return values, next_time_hiddens
 
-# agent
+# agent - handles both inference and ppo learning for asymmetric actor / critic
 
 class Agent(Module):
     def __init__(
@@ -467,6 +512,9 @@ class Agent(Module):
         actor: Module,
         critic: Module,
         *,
+        clip = 0.2,
+        entropy_weight = 0.01,
+        norm_advantages = True,
         actor_state_keys: tuple[str, ...] | None = None,
         critic_state_keys: tuple[str, ...] | None = None
     ):
@@ -474,20 +522,112 @@ class Agent(Module):
         self.actor = actor
         self.critic = critic
 
+        # ppo hyperparameters
+
+        self.clip = clip
+        self.entropy_weight = entropy_weight
+        self.norm_advantages = norm_advantages
+
         self.actor_state_keys = actor_state_keys
         self.critic_state_keys = critic_state_keys
+
+    def route_states(
+        self,
+        states: dict[str, Tensor] | Sequence[Tensor] | Tensor
+    ):
+        actor_states = pluck(states, self.actor_state_keys) if exists(self.actor_state_keys) else states
+        critic_states = pluck(states, self.critic_state_keys) if exists(self.critic_state_keys) else states
+        return actor_states, critic_states
+
+    # ppo losses
+
+    def actor_loss(
+        self,
+        states: dict[str, Tensor] | Sequence[Tensor] | Tensor,
+        actions: Tensor,
+        old_log_probs: Tensor,
+        advantages: Tensor,
+        *,
+        mask: Tensor | None = None,
+        lens: Tensor | None = None,
+        skill_groups = None,
+        time_hiddens = None,
+        clip: float | None = None,
+        entropy_weight: float | None = None
+    ):
+        actor_states, _ = self.route_states(states)
+        mask = lens_to_mask(lens) if exists(lens) and not exists(mask) else mask
+
+        clip = default(clip, self.clip)
+        entropy_weight = default(entropy_weight, self.entropy_weight)
+
+        # sample actions from current policy and derive log probs
+
+        dist, _ = self.actor(actor_states, time_hiddens = time_hiddens, skill_groups = skill_groups, return_action_distr = True)
+
+        log_probs = self.actor.action_distr.log_prob(dist, actions)
+        entropy = reduce(dist.entropy(), '... d -> ...', 'sum')
+
+        # maybe normalize advantages (masked z-score)
+
+        if self.norm_advantages:
+            advantages = z_score(advantages, mask = mask)
+
+        # clipped surrogate objective
+
+        ratios = (log_probs - old_log_probs).exp()
+        clipped_ratios = ratios.clamp(1. - clip, 1. + clip)
+
+        policy_loss = -torch.minimum(ratios * advantages, clipped_ratios * advantages)
+
+        # entropy bonus
+
+        policy_loss = policy_loss - entropy * entropy_weight
+
+        return masked_mean(policy_loss, mask)
+
+    def critic_loss(
+        self,
+        states: dict[str, Tensor] | Sequence[Tensor] | Tensor,
+        returns: Tensor, # value targets for the critic
+        *,
+        mask: Tensor | None = None,
+        lens: Tensor | None = None,
+        skill_groups = None,
+        time_hiddens = None
+    ):
+        _, critic_states = self.route_states(states)
+        mask = lens_to_mask(lens) if exists(lens) and not exists(mask) else mask
+
+        value_loss, _ = self.critic(critic_states, time_hiddens = time_hiddens, skill_groups = skill_groups, target = returns, mask = mask)
+
+        return value_loss
+
+    # inference
+
+    def forward_actor(
+        self,
+        states: dict[str, Tensor] | Sequence[Tensor] | Tensor,
+        **kwargs
+    ):
+        actor_states, _ = self.route_states(states)
+        return self.actor(actor_states, **kwargs)
+
+    def forward_critic(
+        self,
+        states: dict[str, Tensor] | Sequence[Tensor] | Tensor,
+        **kwargs
+    ):
+        _, critic_states = self.route_states(states)
+        return self.critic(critic_states, **kwargs)
 
     def forward(
         self,
         states: dict[str, Tensor] | Sequence[Tensor] | Tensor,
         **kwargs
     ):
-        actor_states = pluck(states, self.actor_state_keys) if exists(self.actor_state_keys) else states
-        critic_states = pluck(states, self.critic_state_keys) if exists(self.critic_state_keys) else states
-
-        actor_out = self.actor(actor_states, **kwargs)
-        critic_out = self.critic(critic_states)
-
+        actor_out = self.forward_actor(states, **kwargs)
+        critic_out = self.forward_critic(states)
         return actor_out, critic_out
 
 # distillation wrapper
@@ -543,9 +683,7 @@ class DistillationWrapper(Module):
 
         # resolve mask from lens if provided
 
-        if exists(lens) and not exists(mask):
-            time_steps = shape(student_states[0], 'b t ...').t
-            mask = lens_to_mask(lens, max_len = time_steps)
+        mask = lens_to_mask(lens) if exists(lens) and not exists(mask) else mask
 
         # resolve aux decoder and target
 
