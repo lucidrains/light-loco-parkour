@@ -145,8 +145,9 @@ class Beta(Module):
         params_or_dist,
         action,
         sum_action_dim = True,
-        eps = 1e-5
+        eps = None
     ):
+        eps = default(eps, self.eps)
         action = action.clamp(min = eps, max = 1. - eps)
         dist = params_or_dist if isinstance(params_or_dist, Distribution) else self(params_or_dist)
         log_prob = dist.log_prob(action)
