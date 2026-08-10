@@ -5,7 +5,12 @@ import torch
 from torch import tensor
 
 from x_mlps_pytorch import create_mlp
-from light_loco_parkour.light_loco_parkour import Actor, Critic, StateEncoder, Gaussian, Beta
+from light_loco_parkour.light_loco_parkour import Actor, Critic, StateEncoder, Gaussian, Beta, Agent
+
+# helpers
+
+def exists(v):
+    return v is not None
 
 @param('skill_groups', [
     1,
@@ -277,3 +282,30 @@ def test_agent_routing(use_dict):
     assert values.shape == (2, 3)
 
     (actions.sum() + values.sum()).backward()
+
+def test_ppo_learning():
+    actor = Actor(
+        512,
+        state_encoder = StateEncoder(512, dim_state = 4 + 5),
+        action_distr = Gaussian()
+    )
+
+    critic = Critic(512, state_encoder = StateEncoder(512, dim_state = 4 + 5))
+
+    agent = Agent(actor, critic)
+
+    images = torch.randn(2, 3, 2, 2)
+    proprio = torch.randn(2, 3, 5)
+    actions = torch.randn(2, 3, 21)
+    old_log_probs = torch.randn(2, 3)
+    advantages = torch.randn(2, 3)
+    returns = torch.rand(2, 3)
+
+    policy_loss = agent.actor_loss((images, proprio), actions, old_log_probs, advantages)
+    value_loss = agent.critic_loss((images, proprio), returns)
+    loss = policy_loss + value_loss
+
+    loss.backward()
+
+    assert all(exists(p.grad) for p in actor.parameters())
+    assert all(exists(p.grad) for p in critic.parameters())

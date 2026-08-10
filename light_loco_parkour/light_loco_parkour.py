@@ -14,6 +14,7 @@ from einops.layers.torch import Rearrange
 
 from torch_einops_utils import (
     pad_left_at_dim,
+    pad_right_at_dim,
     pad_right_ndim_to,
     lens_to_mask,
     masked_mean,
@@ -26,6 +27,8 @@ from torch_einops_utils.shape import shape, is_shape
 from x_mlps_pytorch import create_mlp, create_filmable_mlp
 
 from hl_gauss_pytorch import HLGaussLayer
+
+from assoc_scan import AssocScan
 
 from torch.distributions import Distribution, Normal, Beta as _Beta
 
@@ -160,17 +163,10 @@ class Beta(Module):
 
         conc = self.concentration(raw_conc)
 
-        # concentration floor for unimodality (alpha > 1 and beta > 1)
+        # convert to beta distribution with exact mean = mean
 
-        min_mean = torch.minimum(mean, 1. - mean).clamp(min = self.eps)
-        conc_unimodal_floor = 1. / min_mean
-
-        total_conc = conc_unimodal_floor + conc
-
-        # convert to beta distribution with exact mean = mean and alpha, beta > 1
-
-        alpha = mean * total_conc
-        beta = (1. - mean) * total_conc
+        alpha = mean * conc
+        beta = (1. - mean) * conc
 
         return _Beta(alpha, beta)
 
@@ -538,6 +534,35 @@ class Agent(Module):
         actor_states = pluck(states, self.actor_state_keys) if exists(self.actor_state_keys) else states
         critic_states = pluck(states, self.critic_state_keys) if exists(self.critic_state_keys) else states
         return actor_states, critic_states
+
+    # gae with assoc scan
+
+    @staticmethod
+    def calc_gae(
+        rewards,
+        values,
+        masks,
+        gamma = 0.99,
+        lam = 0.95,
+        use_accelerated = None
+    ):
+        assert values.shape[-1] == rewards.shape[-1]
+
+        use_accelerated = default(use_accelerated, rewards.is_cuda)
+
+        values = pad_right_at_dim(values, 1, value = 0.)
+        values, values_next = values[..., :-1], values[..., 1:]
+
+        delta = rewards + gamma * values_next * masks - values
+        gates = gamma * lam * masks
+
+        scan = AssocScan(reverse = True, use_accelerated = use_accelerated)
+
+        gae = scan(gates, delta)
+
+        returns = gae + values
+
+        return returns
 
     # ppo losses
 
