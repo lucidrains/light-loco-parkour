@@ -28,3 +28,12 @@ Implementation of [Light Loco Parkour](https://light-loco-parkour.github.io/), V
     url     = {https://www.mdpi.com/1424-8220/25/1/191}
 }
 ```
+
+```bibtex
+@inproceedings{Huang2025TheGI,
+    title   = {The GAN is dead; long live the GAN! A Modern GAN Baseline},
+    author  = {Yiwen Huang and Aaron Gokaslan and Volodymyr Kuleshov and James Tompkin},
+    year    = {2025},
+    url     = {https://api.semanticscholar.org/CorpusID:275405495}
+}
+```

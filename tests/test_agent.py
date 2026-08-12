@@ -3,9 +3,24 @@ param = pytest.mark.parametrize
 
 import torch
 from torch import tensor
+from torch.nn import Module
 
 from x_mlps_pytorch import create_mlp
-from light_loco_parkour.light_loco_parkour import Actor, Critic, StateEncoder, Gaussian, Beta, Agent
+from light_loco_parkour.light_loco_parkour import (
+    Actor,
+    Critic,
+    Agent,
+    State,
+    Gaussian,
+    Beta,
+    StateEncoder,
+    RewardHyperParams,
+    RewardShapingWrapper,
+    StatefulReward,
+    reward_linear_velocity_tracking,
+    Discriminator,
+    MotionPrior
+)
 
 # helpers
 
@@ -123,11 +138,7 @@ def test_distillation_wrapper(has_aux_decoder):
     # unreduced loss
 
     unreduced_loss = distill(states, teacher_skill_groups = 1, return_unreduced = True)
-
-    if has_aux_decoder:
-        assert unreduced_loss.shape == (2, 3)
-    else:
-        assert unreduced_loss.shape == (2, 3, 21)
+    assert unreduced_loss.shape == (2, 3)
 
     # loss breakdown
 
@@ -309,3 +320,135 @@ def test_ppo_learning():
 
     assert all(exists(p.grad) for p in actor.parameters())
     assert all(exists(p.grad) for p in critic.parameters())
+
+def mock_state(batch = 4, d = 21, k = 8, l = 6):
+    return State(
+        linear_velocity = torch.randn(batch, 3),
+        angular_velocity = torch.randn(batch, 3),
+        projected_gravity = torch.randn(batch, 3),
+        commanded_velocity = torch.randn(batch, 3),
+        joint_limit_flags = torch.rand(batch, d) > 0.9,
+        contact_forces = torch.rand(batch, l) * 2.,
+        foot_contact = torch.rand(batch, 2) > 0.5,
+        foot_heights = torch.rand(batch, 2),
+        foot_ray_hit_heights = torch.rand(batch, 2, k) * 0.3,
+        foot_acceleration = torch.rand(batch, 2, 3) * 40.,
+        heading_error = torch.rand(batch),
+        action_rate = torch.randn(batch, d)
+    )
+
+def test_reward_shaping():
+    wrapper = RewardShapingWrapper(reward_hparams = RewardHyperParams())
+
+    state = mock_state()
+    state.linear_velocity.requires_grad_(True)
+
+    reward = wrapper(state)
+    assert reward.shape == (4,)
+
+    reward.sum().backward()
+    assert state.linear_velocity.grad is not None
+
+    # the equation 5 decay filter carries over between steps, and resets
+    assert not torch.allclose(wrapper(state), reward)
+
+    wrapper.reset_()
+    assert torch.allclose(wrapper(state), reward)
+
+def test_reward_weights_and_registration():
+    state = mock_state()
+    state.linear_velocity[:, :2] = state.commanded_velocity[:, :2]
+    state.foot_acceleration.zero_()
+
+    # per-reward weight overrides, keyed by function name
+    wrapper = RewardShapingWrapper(
+        reward_fns = ((reward_linear_velocity_tracking, 2.0),),
+        reward_weights = {'reward_linear_velocity_tracking': 3.0},
+        reward_hparams = RewardHyperParams()
+    )
+    assert torch.allclose(wrapper(state), torch.full((4,), 3.0))
+
+    # custom reward functions can be registered at runtime
+    def reward_base_height(state, hparams):
+        return state.heading_error
+
+    wrapper = RewardShapingWrapper(reward_fns = (), reward_hparams = RewardHyperParams())
+    wrapper.add_reward_function_(reward_base_height, 5.)
+    assert torch.allclose(wrapper(state), state.heading_error * 5.)
+
+    # ... and stateful ones, with reset
+    class AccumulatingReward(StatefulReward):
+        def __init__(self):
+            super().__init__()
+            self.accum = None
+
+        def reset_(self):
+            self.accum = None
+
+        def forward(self, state, hparams):
+            new = state.heading_error
+            self.accum = new if not exists(self.accum) else self.accum + new
+            return self.accum
+
+    wrapper = RewardShapingWrapper(
+        reward_fns = (),
+        stateful_reward_fns = ((AccumulatingReward(), 1.0),),
+        reward_hparams = RewardHyperParams()
+    )
+
+    reward = wrapper(state)
+    assert torch.allclose(wrapper(state), reward * 2.)
+
+    wrapper.reset_()
+    assert torch.allclose(wrapper(state), reward)
+
+def test_stateful_state_not_shared():
+    wrapper_a = RewardShapingWrapper(reward_hparams = RewardHyperParams())
+    wrapper_b = RewardShapingWrapper(reward_hparams = RewardHyperParams())
+
+    state = mock_state()
+    state.foot_acceleration.zero_()
+    state.foot_acceleration[..., 0] = 40. # above the threshold, so the filter accumulates
+
+    reward_a1 = wrapper_a(state)
+    reward_a2 = wrapper_a(state)
+    reward_b1 = wrapper_b(state) # fresh wrapper - must start from a zeroed filter
+
+    assert torch.allclose(reward_b1, reward_a1)
+    assert not torch.allclose(reward_b1, reward_a2)
+
+def test_motion_prior():
+    prior = MotionPrior(Discriminator(512, dim_in = 64))
+
+    real = torch.randn(4, 8, 64)
+    fake = torch.randn(4, 8, 64)
+
+    assert prior(real).shape == (4, 8)
+
+    loss = prior.discriminator_loss(real, fake)
+    loss.backward()
+    assert all(p.grad is not None for p in prior.discriminator.parameters())
+
+    # equation 12 - the amp reward is always positive, and grows with realness
+    assert (prior.reward(fake) > 0.).all()
+
+    # with a fixed discriminator, reward must grow monotonically with the logit (softplus)
+    class FixedLogit(Module):
+        def forward(self, states):
+            return states.mean(dim = -1)
+
+    prior = MotionPrior(FixedLogit())
+    realistic, fake = torch.full((1, 8, 64), 5.), torch.full((1, 8, 64), -5.)
+    assert (prior.reward(realistic) > prior.reward(fake)).all()
+
+    # gradient penalty configurable - one-centered (wgan-gp) or disabled
+    assert MotionPrior(Discriminator(512, dim_in = 64), grad_penalty_center = 1.).discriminator_loss(real, fake).ndim == 0
+    assert MotionPrior(Discriminator(512, dim_in = 64), use_grad_penalty = False).discriminator_loss(real, fake).ndim == 0
+
+    # loss breakdown - total loss is the sum of its parts
+    loss, (bce_loss, grad_penalty) = prior.discriminator_loss(real, fake, return_loss_breakdown = True)
+    assert torch.allclose(loss, bce_loss + grad_penalty)
+
+    no_gp = MotionPrior(Discriminator(512, dim_in = 64), use_grad_penalty = False)
+    loss, (bce_loss, grad_penalty) = no_gp.discriminator_loss(real, fake, return_loss_breakdown = True)
+    assert torch.allclose(loss, bce_loss) and grad_penalty == 0.

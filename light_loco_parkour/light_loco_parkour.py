@@ -1,4 +1,6 @@
 from __future__ import annotations
+import math
+from dataclasses import dataclass
 from typing import Sequence
 from beartype import beartype
 from contextlib import nullcontext
@@ -48,6 +50,9 @@ def cast_tuple(v, length = 1):
 
 def pluck(d, keys):
     return [d[k] for k in keys]
+
+def l2norm(t, dim = -1, eps = 1e-12):
+    return F.normalize(t, dim = dim, eps = eps)
 
 # action distributions
 
@@ -138,7 +143,7 @@ class Beta(Module):
         params
     ):
         raw_mean, _ = params.unbind(dim = -1)
-        return raw_mean.sigmoid()
+        return raw_mean.sigmoid().clamp(min = self.eps, max = 1. - self.eps)
 
     def log_prob(
         self,
@@ -156,9 +161,9 @@ class Beta(Module):
     def forward(self, params):
         raw_mean, raw_conc = params.unbind(dim = -1)
 
-        # mean mapped to (0, 1)
+        # mean mapped to (0, 1), clamped so the concentration parameters stay positive
 
-        mean = raw_mean.sigmoid()
+        mean = raw_mean.sigmoid().clamp(min = self.eps, max = 1. - self.eps)
 
         # positive concentration
 
@@ -547,11 +552,17 @@ class Agent(Module):
         lam = 0.95,
         use_accelerated = None
     ):
-        assert values.shape[-1] == rewards.shape[-1]
+        n_steps = rewards.shape[-1]
+        n_values = values.shape[-1]
 
-        use_accelerated = default(use_accelerated, rewards.is_cuda)
+        # values may be aligned with rewards (bootstrapping zero at the end),
+        # or hold one extra step carrying the bootstrap value of the next state
 
-        values = pad_right_at_dim(values, 1, value = 0.)
+        assert n_values in (n_steps, n_steps + 1)
+
+        if n_values == n_steps:
+            values = pad_right_at_dim(values, 1, value = 0.)
+
         values, values_next = values[..., :-1], values[..., 1:]
 
         delta = rewards + gamma * values_next * masks - values
@@ -757,12 +768,12 @@ class DistillationWrapper(Module):
         # compute distillation mse loss
 
         distill_loss = F.mse_loss(student_mean, teacher_mean, reduction = 'none')
+        distill_loss = reduce(distill_loss, '... d -> ...', 'mean')
 
         # maybe combine with aux loss
 
         if has_aux:
             aux_loss = reduce(aux_loss, '... d -> ...', 'mean') * self.aux_loss_weight
-            distill_loss = reduce(distill_loss, '... d -> ...', 'mean')
 
         loss = distill_loss + aux_loss
 
@@ -796,6 +807,314 @@ class DistillationWrapper(Module):
         loss_breakdown = (distill_loss, aux_loss)
 
         return loss, loss_breakdown
+
+# reward shaping (section iv-c, table 1)
+# each reward function returns one scalar per sample; RewardShapingWrapper sums them with their weights
+
+@dataclass
+class State:
+    linear_velocity: Tensor
+    angular_velocity: Tensor
+    projected_gravity: Tensor
+    commanded_velocity: Tensor
+    joint_limit_flags: Tensor
+    contact_forces: Tensor
+    foot_contact: Tensor
+    foot_heights: Tensor
+    foot_ray_hit_heights: Tensor
+    foot_acceleration: Tensor
+    heading_error: Tensor
+    action_rate: Tensor
+
+@dataclass
+class RewardHyperParams:
+    sigma_linear: float = 0.25
+    sigma_angular: float = 0.25
+    slack_low: float = 0.3
+    slack_high: float = 1.5
+    footstep_threshold: float = 0.1
+    contact_force_threshold: float = 1.
+    foot_accel_threshold: float = 30.
+    foot_accel_tau: float = 0.06
+    dt: float = 0.02
+
+def gaussian_kernel(errors, sigma):
+    # equation 1 - exp(-||errors||^2 / sigma^2), peaks at 1 when the error is zero
+    return (-errors.square().sum(dim = -1) / (sigma ** 2)).exp()
+
+def reward_linear_velocity_tracking(state: State, hparams: RewardHyperParams):
+    # equation 1 - track the commanded planar velocity (x, y)
+    error = state.linear_velocity[..., :2] - state.commanded_velocity[..., :2]
+    return gaussian_kernel(error, hparams.sigma_linear)
+
+def reward_angular_velocity_tracking(state: State, hparams: RewardHyperParams):
+    # equation 1 - exponential kernel on yaw rate error
+    error = state.angular_velocity[..., 2:3] - state.commanded_velocity[..., 2:3]
+    return gaussian_kernel(error, hparams.sigma_angular)
+
+def reward_upright_orientation(state: State, hparams: RewardHyperParams):
+    # equation 2 - stay upright: tilt is how far the projected gravity vector leans from the vertical
+    tilt_error = state.projected_gravity[..., :2].norm(dim = -1)
+    return (-2 * tilt_error.square()).exp() + 0.1 * (-tilt_error).exp()
+
+def reward_velocity_slack(state: State, hparams: RewardHyperParams):
+    # equation 3 - reward forward speed within [slack_low, slack_high] of the commanded speed
+    forward_speed = state.linear_velocity[..., 0]
+    commanded_speed = state.commanded_velocity[..., 0]
+
+    slow_enough = forward_speed >= hparams.slack_low * commanded_speed
+    fast_enough = forward_speed <= hparams.slack_high * commanded_speed
+    is_commanded = commanded_speed > 0.
+
+    return (slow_enough & fast_enough & is_commanded).float()
+
+def reward_undesired_contact(state: State, hparams: RewardHyperParams):
+    # table 1 - penalize contact on any link other than the feet
+    contact = (state.contact_forces > hparams.contact_force_threshold).float()
+    return reduce(contact, 'b ... -> b', 'sum')
+
+def reward_joint_limit(state: State, hparams: RewardHyperParams):
+    # table 1 - penalize joints that are near a limit and moving toward it
+    return reduce(state.joint_limit_flags.float(), 'b ... -> b', 'sum')
+
+def reward_illegal_footstep(state: State, hparams: RewardHyperParams):
+    # equation 4 - penalize steps where any ray under a contacting foot hits ground too far below it
+    foot_ray_depth = state.foot_heights[..., None] - state.foot_ray_hit_heights
+    illegal_fraction = (foot_ray_depth > hparams.footstep_threshold).float().mean(dim = -1)
+    return reduce(illegal_fraction * state.foot_contact, 'b ... -> b', 'sum')
+
+def reward_heading_error(state: State, hparams: RewardHyperParams):
+    # table 1 - penalize deviation from the commanded heading
+    return state.heading_error.abs()
+
+def reward_opposite_direction(state: State, hparams: RewardHyperParams):
+    # table 1 - penalize moving against the commanded direction
+    current = state.linear_velocity[..., :2]
+    commanded_direction = l2norm(state.commanded_velocity[..., :2])
+    return F.relu(-(current * commanded_direction).sum(dim = -1))
+
+def reward_action_rate(state: State, hparams: RewardHyperParams):
+    # table 1 - penalize abrupt changes in actions
+    return reduce(state.action_rate.square(), 'b ... -> b', 'sum')
+
+DEFAULT_REWARD_FNS = (
+    (reward_linear_velocity_tracking, 2.0),
+    (reward_angular_velocity_tracking, 2.0),
+    (reward_upright_orientation, 1.0),
+    (reward_velocity_slack, 1.5),
+    (reward_undesired_contact, -2.0),
+    (reward_joint_limit, -10.0),
+    (reward_illegal_footstep, -1.0),
+    (reward_heading_error, -1.0),
+    (reward_opposite_direction, -1.0),
+    (reward_action_rate, -0.1)
+)
+
+class StatefulReward(Module):
+    # reward function with state across calls
+    def reset_(self):
+        raise NotImplementedError
+
+    def forward(self, state, hparams):
+        raise NotImplementedError
+
+class FootAccelerationPenalty(StatefulReward):
+    # equation 5 - penalize foot acceleration above the threshold, smoothed over time
+    # so a single spike is remembered for a few steps and sustained jerk keeps growing
+    def __init__(self):
+        super().__init__()
+        self.prev_excess_accel = None
+
+    def reset_(self):
+        self.prev_excess_accel = None
+
+    def forward(self, state, hparams):
+        alpha = math.exp(-hparams.dt / hparams.foot_accel_tau)
+
+        excess_accel = F.relu(state.foot_acceleration.norm(dim = -1) - hparams.foot_accel_threshold)
+        excess_accel = reduce(excess_accel, 'b ... -> b', 'sum')
+
+        # lazy init of the running filter; reset it if the batch size or device changes
+        if self.prev_excess_accel is None or self.prev_excess_accel.shape != excess_accel.shape or self.prev_excess_accel.device != excess_accel.device:
+            self.prev_excess_accel = excess_accel.new_zeros(excess_accel.shape)
+
+        filtered = alpha * self.prev_excess_accel + excess_accel
+        self.prev_excess_accel = filtered.detach()
+
+        return filtered
+
+def default_stateful_reward_fns():
+    # instantiate fresh per wrapper, so state is not shared
+    return ((FootAccelerationPenalty(), 0.01),)
+
+class RewardShapingWrapper(Module):
+    def __init__(
+        self,
+        reward_fns = DEFAULT_REWARD_FNS,
+        stateful_reward_fns = None,
+        reward_weights: dict | None = None, # dict of fn name -> weight overrides
+        reward_hparams: RewardHyperParams | None = None
+    ):
+        super().__init__()
+        stateful_reward_fns = default(stateful_reward_fns, default_stateful_reward_fns())
+
+        self.reward_fns = {reward_fn.__name__: (reward_fn, weight) for reward_fn, weight in reward_fns}
+        self.stateful_reward_fns = {
+            reward_fn.__class__.__name__: (reward_fn, weight)
+            for reward_fn, weight in stateful_reward_fns
+        }
+        self.reward_weights = default(reward_weights, dict())
+        self.reward_hparams = reward_hparams
+        self.reset_()
+
+    def add_reward_function_(
+        self,
+        reward_fn,
+        weight
+    ):
+        reward_fn_name = reward_fn.__name__
+        assert reward_fn_name not in self.reward_fns, 'reward function names must be unique'
+        self.reward_fns[reward_fn_name] = (reward_fn, weight)
+
+    def delete_reward_function_(
+        self,
+        reward_fn_name
+    ):
+        assert reward_fn_name in self.reward_fns
+        del self.reward_fns[reward_fn_name]
+
+    def add_stateful_reward_function_(
+        self,
+        reward_fn,
+        weight
+    ):
+        reward_fn_name = reward_fn.__class__.__name__
+        assert reward_fn_name not in self.stateful_reward_fns, 'stateful reward function names must be unique'
+        self.stateful_reward_fns[reward_fn_name] = (reward_fn, weight)
+
+    def delete_stateful_reward_function_(
+        self,
+        reward_fn_name
+    ):
+        assert reward_fn_name in self.stateful_reward_fns
+        del self.stateful_reward_fns[reward_fn_name]
+
+    def reset_(self):
+        for reward_fn, _ in self.stateful_reward_fns.values():
+            reward_fn.reset_()
+
+    def forward(
+        self,
+        state: State,
+        reward_hparams: RewardHyperParams | None = None
+    ):
+        # section iv-c1 - weighted sum of reward terms
+
+        reward_hparams = default(reward_hparams, self.reward_hparams)
+        assert exists(reward_hparams), 'reward hyperparameters must be provided'
+
+        total_reward = state.linear_velocity.new_zeros(state.linear_velocity.shape[0])
+
+        for reward_fns in (self.reward_fns, self.stateful_reward_fns):
+            for reward_fn_name, (reward_fn, weight) in reward_fns.items():
+                weight = self.reward_weights.get(reward_fn_name, weight)
+                total_reward = total_reward + reward_fn(state, reward_hparams) * weight
+
+        return total_reward
+
+# motion prior (equation 12)
+
+def gradient_penalty(inputs, output, weight = 10., center = 0.):
+    # center = 0. is zero-centered (modern gan baseline), center = 1. is one-centered (wgan-gp)
+
+    gradients, = torch.autograd.grad(
+        outputs = output,
+        inputs = inputs,
+        grad_outputs = torch.ones_like(output),
+        create_graph = True,
+        retain_graph = True
+    )
+
+    gradients = rearrange(gradients, 'b ... -> b (...)')
+
+    return weight * ((gradients.norm(dim = 1) - center) ** 2).mean()
+
+class Discriminator(Module):
+    # equation 12 - the amp discriminator D_phi
+
+    def __init__(
+        self,
+        dim,
+        *,
+        dim_in,
+        depth = 4
+    ):
+        super().__init__()
+        self.net = create_mlp(dim, dim_in = dim_in, dim_out = 1, depth = depth)
+
+    def forward(self, states):
+        logits = self.net(states)
+        return rearrange(logits, '... 1 -> ...')
+
+class MotionPrior(Module):
+    def __init__(
+        self,
+        discriminator: Discriminator,
+        *,
+        grad_penalty_weight = 10.,
+        grad_penalty_center = 0.,
+        use_grad_penalty = True
+    ):
+        super().__init__()
+        self.discriminator = discriminator
+        self.grad_penalty_weight = grad_penalty_weight
+        self.grad_penalty_center = grad_penalty_center
+        self.use_grad_penalty = use_grad_penalty
+
+        self.register_buffer('zero', tensor(0.), persistent = False)
+
+    def reward(self, states):
+        # equation 12 - r_amp = -log(1 - D) = softplus(logit)
+        logits = self.discriminator(states)
+        return F.softplus(logits)
+
+    def discriminator_loss(self, real, fake, return_loss_breakdown = False):
+        # section v-c2 - bce between real references and policy rollouts
+
+        # labels
+
+        labels = cat((torch.ones_like(real[..., 0]), torch.zeros_like(fake[..., 0])))
+
+        real_and_fake = cat((real, fake))
+
+        if self.use_grad_penalty:
+            real_and_fake = real_and_fake.requires_grad_(True)
+
+        logits = self.discriminator(real_and_fake)
+
+        bce_loss = F.binary_cross_entropy_with_logits(logits, labels)
+
+        # gradient penalty
+
+        grad_penalty = self.zero
+
+        if self.use_grad_penalty:
+            grad_penalty = gradient_penalty(
+                real_and_fake,
+                logits,
+                weight = self.grad_penalty_weight,
+                center = self.grad_penalty_center
+            )
+
+        loss = bce_loss + grad_penalty
+
+        if not return_loss_breakdown:
+            return loss
+
+        return loss, (bce_loss, grad_penalty)
+
+    def forward(self, states):
+        return self.discriminator(states)
 
 # training wrapper
 
