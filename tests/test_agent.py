@@ -19,13 +19,11 @@ from light_loco_parkour.light_loco_parkour import (
     StatefulReward,
     reward_linear_velocity_tracking,
     Discriminator,
-    MotionPrior
+    MotionPrior,
+    exists
 )
 
 # helpers
-
-def exists(v):
-    return v is not None
 
 @param('skill_groups', [
     1,
@@ -347,7 +345,7 @@ def test_reward_shaping():
     assert reward.shape == (4,)
 
     reward.sum().backward()
-    assert state.linear_velocity.grad is not None
+    assert exists(state.linear_velocity.grad)
 
     # the equation 5 decay filter carries over between steps, and resets
     assert not torch.allclose(wrapper(state), reward)
@@ -417,35 +415,47 @@ def test_stateful_state_not_shared():
     assert torch.allclose(reward_b1, reward_a1)
     assert not torch.allclose(reward_b1, reward_a2)
 
-def test_motion_prior():
-    prior = MotionPrior(Discriminator(512, dim_in = 64))
+class FixedLogit(Module):
+    # a discriminator that scores by its input mean, so the reward is closed-form
 
+    def forward(self, states):
+        return states.mean(dim = -1)
+
+def test_motion_prior():
     real = torch.randn(4, 8, 64)
     fake = torch.randn(4, 8, 64)
 
+    prior = MotionPrior(Discriminator(512, dim_in = 64))
+
+    # logits from the discriminator; the equation 12 reward is positive and grows with realness
+
     assert prior(real).shape == (4, 8)
+    assert (prior.reward(fake) > 0.).all()
+
+    # the discriminator is trained to tell real from fake, and receives gradients
 
     loss = prior.discriminator_loss(real, fake)
     loss.backward()
-    assert all(p.grad is not None for p in prior.discriminator.parameters())
 
-    # equation 12 - the amp reward is always positive, and grows with realness
-    assert (prior.reward(fake) > 0.).all()
+    assert all(exists(p.grad) for p in prior.discriminator.parameters())
 
-    # with a fixed discriminator, reward must grow monotonically with the logit (softplus)
-    class FixedLogit(Module):
-        def forward(self, states):
-            return states.mean(dim = -1)
+    # with a fixed discriminator, the softplus reward grows monotonically with the logit
 
-    prior = MotionPrior(FixedLogit())
-    realistic, fake = torch.full((1, 8, 64), 5.), torch.full((1, 8, 64), -5.)
-    assert (prior.reward(realistic) > prior.reward(fake)).all()
+    fixed = MotionPrior(FixedLogit())
 
-    # gradient penalty configurable - one-centered (wgan-gp) or disabled
-    assert MotionPrior(Discriminator(512, dim_in = 64), grad_penalty_center = 1.).discriminator_loss(real, fake).ndim == 0
-    assert MotionPrior(Discriminator(512, dim_in = 64), use_grad_penalty = False).discriminator_loss(real, fake).ndim == 0
+    realistic = torch.full((1, 8, 64), 5.)
+    unreal = torch.full((1, 8, 64), -5.)
 
-    # loss breakdown - total loss is the sum of its parts
+    assert (fixed.reward(realistic) > fixed.reward(unreal)).all()
+
+    # the gradient penalty is configurable - one-centered (wgan-gp) or off
+
+    for kwargs in (dict(grad_penalty_center = 1.), dict(use_grad_penalty = False)):
+        configured = MotionPrior(Discriminator(512, dim_in = 64), **kwargs)
+        assert configured.discriminator_loss(real, fake).ndim == 0
+
+    # the loss breakdown sums to the total, with no penalty when disabled
+
     loss, (bce_loss, grad_penalty) = prior.discriminator_loss(real, fake, return_loss_breakdown = True)
     assert torch.allclose(loss, bce_loss + grad_penalty)
 

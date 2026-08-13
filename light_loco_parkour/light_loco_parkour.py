@@ -6,8 +6,8 @@ from beartype import beartype
 from contextlib import nullcontext
 
 import torch
-from torch import nn, cat, stack, is_tensor, tensor, Tensor
-from torch.nn import Module, Linear, RMSNorm
+from torch import nn, cat, stack, einsum, is_tensor, tensor, diff, Tensor
+from torch.nn import Module, ModuleList, Linear, RMSNorm
 import torch.nn.functional as F
 
 import einx
@@ -15,6 +15,9 @@ from einops import rearrange, repeat, reduce
 from einops.layers.torch import Rearrange
 
 from torch_einops_utils import (
+    maybe,
+    cast_tensor,
+    pad_left_ndim_to,
     pad_left_at_dim,
     pad_right_at_dim,
     pad_right_ndim_to,
@@ -50,6 +53,14 @@ def cast_tuple(v, length = 1):
 
 def pluck(d, keys):
     return [d[k] for k in keys]
+
+def cast_to_tensor(t, device = None):
+    t = maybe(cast_tensor)(t, device = device)
+
+    if exists(t) and not is_tensor(t):
+        t = tensor(t, device = device)
+
+    return t
 
 def l2norm(t, dim = -1, eps = 1e-12):
     return F.normalize(t, dim = dim, eps = eps)
@@ -1115,6 +1126,177 @@ class MotionPrior(Module):
 
     def forward(self, states):
         return self.discriminator(states)
+
+# phase conditional motion prior (section v-c2, equation 12)
+# the amp prior switches between the locomotion and skill discriminators
+# once the robot passes the prior transition position ahead of the obstacle, driving the handoff
+
+class PhaseConditionalMotionPrior(Module):
+    def __init__(
+        self,
+        motion_priors: MotionPrior | Sequence[MotionPrior],
+        *,
+        prior_transition_positions: Tensor | float | Sequence[float] | None = None,
+        smooth_handoff = False,
+        handoff_temperature = 1.
+    ):
+        super().__init__()
+
+        self.smooth_handoff = smooth_handoff
+        self.handoff_temperature = handoff_temperature
+
+        prior_transition_positions = cast_to_tensor(prior_transition_positions)
+        prior_transition_positions = maybe(pad_left_ndim_to)(prior_transition_positions, 1)
+
+        is_single = isinstance(motion_priors, MotionPrior)
+
+        # a single prior is replicated (shared weights) across the phases
+
+        if is_single:
+            assert exists(prior_transition_positions), 'a single motion prior cannot tell us how many phases there are; provide prior_transition_positions (the number of phases is its length plus one)'
+
+            motion_priors = [motion_priors] * (len(prior_transition_positions) + 1)
+
+        self.motion_priors = ModuleList(motion_priors)
+        self.num_phases = len(self.motion_priors)
+
+        if exists(prior_transition_positions):
+            assert len(prior_transition_positions) == self.num_phases - 1, f'need one phase per motion prior: {len(prior_transition_positions)} transition positions divide the track into {len(prior_transition_positions) + 1} phases, but {self.num_phases} priors were given'
+
+        self.register_buffer('prior_transition_positions', prior_transition_positions, persistent = False)
+
+    def resolve_transition_positions(self, prior_transition_positions = None, device = None):
+        # the per-call transition positions, defaulting to the ones given at construction
+
+        prior_transition_positions = default(prior_transition_positions, self.prior_transition_positions)
+        assert exists(prior_transition_positions), 'pass prior_transition_positions to place the phase switches (or construct the prior with them)'
+
+        return cast_to_tensor(prior_transition_positions, device = device)
+
+    def resolve_phases(self, positions = None, prior_transition_positions = None, phases = None):
+        # explicit phases take priority over automatic resolution
+
+        if exists(phases):
+            return phases
+
+        assert exists(positions), 'pass positions to resolve the phase automatically, or pass phases explicitly'
+
+        # a flat position trace (no batch dim) is treated as one trajectory and broadcast over the batch
+
+        if positions.ndim == 1:
+            positions = rearrange(positions, 'n -> 1 n')
+
+        # the phase is the number of transition positions passed
+
+        prior_transition_positions = self.resolve_transition_positions(prior_transition_positions, device = positions.device)
+
+        passed = einx.greater('b ... , n -> b ... n', positions, prior_transition_positions)
+        return reduce(passed, 'b ... n -> b ...', 'sum')
+
+    def phase_weights(self, positions = None, prior_transition_positions = None, phases = None):
+        # hard selection - one hot of the resolved phase
+
+        if not self.smooth_handoff or exists(phases):
+            phases = self.resolve_phases(positions, prior_transition_positions, phases)
+            return F.one_hot(phases.long(), self.num_phases).float()
+
+        # smooth handoff - cumulative sigmoid switches across the transition positions, so the
+        # phase weights shift gradually and always sum to one
+
+        assert exists(positions), 'the smooth handoff needs positions to know how close the robot is to each transition point'
+
+        # a flat position trace (no batch dim) is treated as one trajectory and broadcast over the batch
+
+        if positions.ndim == 1:
+            positions = rearrange(positions, 'n -> 1 n')
+
+        prior_transition_positions = self.resolve_transition_positions(prior_transition_positions, device = positions.device)
+
+        switches = (einx.subtract('b ... , n -> b ... n', positions, prior_transition_positions) * self.handoff_temperature).sigmoid()
+
+        phase_switch_shape = (*positions.shape, 1)
+
+        ones = positions.new_ones(phase_switch_shape)
+        zeros = positions.new_zeros(phase_switch_shape)
+
+        # weight_i = switch_i - switch_{i + 1}, so the weights always sum to one
+
+        switches = cat((ones, switches, zeros), dim = -1)
+
+        return -diff(switches, dim = -1)
+
+    def auto_positions(self, num_steps, prior_transition_positions = None):
+        # when positions are not given, assume the time steps traverse the track uniformly,
+        # from the start of the track to one trigger-spacing past the last transition, so
+        # every phase is visited
+
+        triggers = default(prior_transition_positions, self.prior_transition_positions)
+        assert exists(triggers), 'automatic positions need prior_transition_positions to span the track'
+
+        triggers = cast_to_tensor(triggers)
+
+        first, *rest = triggers
+        last = first if not rest else rest[-1]
+
+        # span the track from its start to one trigger-spacing past the last transition
+
+        lo = torch.minimum(first, triggers.new_tensor(0.))
+
+        if not rest:
+            hi = 2 * last
+        else:
+            spacing = (last - first) / len(rest)
+            hi = last + spacing
+
+        return torch.linspace(lo, hi, num_steps, device = triggers.device, dtype = triggers.dtype)
+
+    def reward(self, states, positions = None, prior_transition_positions = None, phases = None):
+        # equation 12 - r_amp = -log(1 - D_phi) from the active phase, or a smooth handoff across them
+
+        if isinstance(phases, int):
+            return self.motion_priors[phases].reward(states)
+
+        # when neither positions nor phases are given, the time steps stand in for the
+        # robot's traversal of the track, with a uniform linspace covering every phase
+
+        if not exists(positions) and not exists(phases):
+            positions = self.auto_positions(states.shape[-2], prior_transition_positions)
+
+        weights = self.phase_weights(positions, prior_transition_positions, phases)
+
+        phase_rewards = stack([prior.reward(states) for prior in self.motion_priors])
+        phase_rewards = rearrange(phase_rewards, 'n b ... -> b ... n')
+
+        weights = pad_right_ndim_to(weights, phase_rewards.ndim)
+
+        # a batch of one (a single flat position trace) is broadcast over the whole batch
+
+        weights = weights.broadcast_to(phase_rewards.shape)
+
+        return einsum('b ... n, b ... n -> b ...', phase_rewards, weights)
+
+    def discriminator_loss(self, real_by_phase, fake_by_phase, return_loss_breakdown = False):
+        # each phase discriminator trains against its own reference distribution
+
+        if isinstance(real_by_phase, dict):
+            real_by_phase = list(real_by_phase.values())
+            fake_by_phase = list(fake_by_phase.values())
+
+        assert len(real_by_phase) == len(fake_by_phase) == self.num_phases, f'one real and one fake transition tensor per phase: expected {self.num_phases} of each, got {len(real_by_phase)} real and {len(fake_by_phase)} fake'
+
+        losses = [prior.discriminator_loss(real, fake) for prior, real, fake in zip(self.motion_priors, real_by_phase, fake_by_phase)]
+
+        loss = sum(losses)
+
+        if not return_loss_breakdown:
+            return loss
+
+        return loss, tuple(losses)
+
+    def forward(self, states):
+        # logits from every phase discriminator
+
+        return stack([prior(states) for prior in self.motion_priors])
 
 # training wrapper
 

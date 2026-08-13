@@ -25,5 +25,7 @@ from light_loco_parkour.light_loco_parkour import (
     reward_action_rate,
     Discriminator,
     MotionPrior,
-    gradient_penalty
+    PhaseConditionalMotionPrior,
+    gradient_penalty,
+    exists
 )
