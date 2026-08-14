@@ -155,7 +155,8 @@ def main(
     min_reward = 100.,
     max_iterations = 300,
     hl_gauss = True,
-    symlog = False
+    symlog = False,
+    min_conc = 0.
 ):
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -172,7 +173,7 @@ def main(
         64,
         state_encoder = StateEncoder(64, dim_state = obs_dim, num_stacked_frames = 1),
         num_actions = 1,
-        action_distr = Beta(),
+        action_distr = Beta(min_conc = min_conc),
         depth = 2
     )
 

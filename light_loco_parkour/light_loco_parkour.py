@@ -130,24 +130,30 @@ class Beta(Module):
         self,
         pos_fn = 'softplus',
         init_conc = 10.,
+        min_conc = 0.,
         eps = 1e-5
     ):
         super().__init__()
         assert pos_fn in ('exp', 'softplus')
+        assert init_conc > min_conc, 'init_conc must be greater than min_conc (the concentration floor)'
+
         self.pos_fn = pos_fn
         self.init_conc = init_conc
+        self.min_conc = min_conc
         self.eps = eps
+
+        # raw offset into the positive fn so the concentration at raw_conc = 0 is exactly init_conc
+
+        self.raw_init_conc = math.log(math.expm1(init_conc - min_conc)) if pos_fn == 'softplus' else math.log(init_conc - min_conc)
 
     def concentration(
         self,
         raw_conc
     ):
-        raw_conc = raw_conc + self.init_conc
-
         if self.pos_fn == 'softplus':
-            return F.softplus(raw_conc) + 2.
+            return F.softplus(raw_conc + self.raw_init_conc) + self.min_conc
         elif self.pos_fn == 'exp':
-            return raw_conc.exp() + 2.
+            return (raw_conc + self.raw_init_conc).exp() + self.min_conc
 
     def mean(
         self,
@@ -179,6 +185,12 @@ class Beta(Module):
         # positive concentration
 
         conc = self.concentration(raw_conc)
+
+        # concentration floor for unimodality (alpha > 1 and beta > 1), keeping the mean exact
+        # alpha = mean * conc > 1 and beta = (1 - mean) * conc > 1 need conc > 1 / min(mean, 1 - mean)
+
+        min_mean = torch.minimum(mean, 1. - mean).clamp(min = self.eps)
+        conc = conc + 1. / min_mean
 
         # convert to beta distribution with exact mean = mean
 
