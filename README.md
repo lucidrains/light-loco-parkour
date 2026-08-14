@@ -7,11 +7,11 @@ Implementation of [Light Loco Parkour](https://light-loco-parkour.github.io/), V
 ## Citations
 
 ```bibtex
-@misc{chen2026lightlocoparkour,
+@article{chen2026light,
     title   = {Light-Loco-Parkour: Versatile Perceptive Whole-Body Locomotion via Multi-Skill Distillation},
-    author  = {Hongming Chen and Zhuoran Li and Hongxi Wang and Jiangpeng Hu and Ziliang Li and Peize Liu and QingRui Zhao and Xuhao Liu and Liang Pan and Ximin Lyu and Yuntao Ma and Tingxiang Fan},
-    year    = {2026},
-    url     = {https://light-loco-parkour.github.io/}
+    author  = {Chen, Hongming and Li, Zhuoran and Wang, Hongxi and Hu, Jiangpeng and Li, Ziliang and Liu, Peize and Zhao, QingRui and Liu, Xuhao and Pan, Liang and Lyu, Ximin and others},
+    journal = {arXiv preprint arXiv:2608.02653},
+    year    = {2026}
 }
 ```
 
