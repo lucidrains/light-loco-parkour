@@ -26,10 +26,11 @@ classifiers = [
 ]
 
 dependencies = [
-    "assoc-scan>=0.0.6",
+    "assoc-scan>=0.0.5",
     "beartype",
     "einx>=0.3.0",
     "einops>=0.8.0",
+    "env-ssl-wrapper>=0.1.0",
     "hl-gauss-pytorch>=0.2.4",
     "torch>=2.5",
     "torch-einops-utils>=0.1.14",
@@ -42,6 +43,8 @@ Repository = "https://github.com/lucidrains/light-loco-parkour"
 
 [project.optional-dependencies]
 test = [
+    "fire>=0.7.1",
+    "gymnasium>=1.3.0",
     "pytest"
 ]
 
