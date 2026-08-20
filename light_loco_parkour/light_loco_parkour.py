@@ -348,6 +348,99 @@ class StateEncoder(Module):
 
         return time_encoded_states, next_time_hiddens
 
+# next latent prediction wrapper (SPR / NLP) - forward dynamics: predict t + 1 latent from t latent + action
+# https://arxiv.org/abs/2007.05929 - "Data-Efficient RL with Self-Predictive Representations" - Schwarzer et al.
+# https://arxiv.org/abs/2511.05963 - "Next-Latent Prediction Transformers Learn Compact World Models" - Teoh et al.
+
+class NextLatentPredictionWrapper(Module):
+    @beartype
+    def __init__(
+        self,
+        head: Module,
+        *,
+        dim: int,
+        dim_action: int,
+        depth = 2,
+        expansion_factor = 2.,
+        loss_weight = 1.,
+        next_latent_prediction: bool | None = None
+    ):
+        super().__init__()
+        self.head = head
+        self.next_latent_prediction = next_latent_prediction
+        self.loss_weight = loss_weight
+
+        self.action_embedder = Linear(dim_action, dim, bias = False)
+
+        self.dynamics = create_mlp(
+            int(dim * expansion_factor),
+            dim_in = dim + dim,
+            dim_out = dim,
+            depth = depth,
+            activation = nn.SiLU(),
+            bias = False
+        )
+
+        self.proj_head = Linear(dim, dim, bias = False)
+
+        self.next_latent_prediction_loss = None
+
+    def forward(
+        self,
+        x,
+        *,
+        action = None,
+        mask = None,
+        next_latent_prediction: bool | None = None
+    ):
+        out = self.head(x)
+
+        # automatically enacted during training, overridable per call
+
+        next_latent_prediction = default(next_latent_prediction, self.next_latent_prediction)
+        next_latent_prediction = default(next_latent_prediction, self.training and torch.is_grad_enabled())
+
+        self.next_latent_prediction_loss = None
+
+        # only enact when the time dimension is present for the next latent prediction
+
+        if not (next_latent_prediction and x.ndim == 3 and x.shape[1] >= 2):
+            return out
+
+        # the action at time t, defaulting to the mean of the head output
+
+        if not exists(action):
+            if not is_tensor(out) or out.ndim not in (3, 4):
+                return out
+
+            action = out[..., 0] if out.ndim == 4 else out
+
+        # forward dynamics: predict the residual (delta) update, applied via a residual
+        # connection onto the current latent - equation 9 of the NLP paper:
+        #   ĥ_{t + 1} = f_ψ(h_t, a_t) + h_t
+
+        action_embed = self.action_embedder(action[:, :-1])
+
+        latent_pred = self.proj_head(x[:, :-1] + self.dynamics(cat((x[:, :-1], action_embed), dim = -1)))
+
+        # target is the next latent, detached, through the same projection head
+
+        target = self.proj_head(x[:, 1:].detach())
+
+        # 2 - 2 * cos = squared distance on unit sphere, bounded so the loss weight can't overwhelm
+
+        loss = 2. - 2. * F.cosine_similarity(latent_pred, target, dim = -1)
+
+        if exists(mask):
+            loss = loss[mask[:, :-1] & mask[:, 1:]]
+
+        if loss.numel() == 0:
+            return out
+
+        self.next_latent_prediction_loss = loss.mean() * self.loss_weight
+
+        return out
+
 # actor
 
 class Actor(Module):
@@ -362,7 +455,8 @@ class Actor(Module):
         distr: Module | None = None,
         action_distr: Module | None = None,
         distr_dim_out = 2,
-        aux_decoder: Module | None = None
+        aux_decoder: Module | None = None,
+        next_latent_prediction: bool | dict | Module | None = None
     ):
         super().__init__()
         self.state_encoder = state_encoder
@@ -377,11 +471,38 @@ class Actor(Module):
 
         self.aux_decoder = aux_decoder
 
-        self.to_actions = nn.Sequential(
+        head = nn.Sequential(
             RMSNorm(dim),
             Linear(dim, num_actions * distr_dim_out),
             Rearrange('... (d distr_params) -> ... d distr_params', distr_params = distr_dim_out)
         )
+
+        # wrap the last output projection head with next latent prediction (SPR / NLP)
+
+        next_latent_prediction = default(next_latent_prediction, dict())
+
+        if isinstance(next_latent_prediction, dict):
+            next_latent_prediction = NextLatentPredictionWrapper(
+                head,
+                dim = dim,
+                dim_action = num_actions,
+                **next_latent_prediction
+            )
+        elif isinstance(next_latent_prediction, bool):
+            next_latent_prediction = NextLatentPredictionWrapper(
+                head,
+                dim = dim,
+                dim_action = num_actions,
+                next_latent_prediction = next_latent_prediction
+            )
+
+        self.to_actions = next_latent_prediction
+
+        self.register_buffer('zero', tensor(0.), persistent = False)
+
+    @property
+    def next_latent_prediction_loss(self):
+        return default(getattr(self.to_actions, 'next_latent_prediction_loss', None), self.zero)
 
     def forward(
         self,
@@ -393,7 +514,10 @@ class Actor(Module):
         sample_action = False,
         return_log_prob = False,
         aux_decoder: Module | None = None,
-        aux_decoder_target: Tensor | None = None
+        aux_decoder_target: Tensor | None = None,
+        action: Tensor | None = None,
+        mask: Tensor | None = None,
+        next_latent_prediction: bool | None = None
     ):
         aux_decoder = default(aux_decoder, self.aux_decoder)
 
@@ -415,7 +539,12 @@ class Actor(Module):
 
         # predict actions
 
-        params = self.to_actions(embed)
+        params = self.to_actions(
+            embed,
+            action = action,
+            mask = mask,
+            next_latent_prediction = next_latent_prediction
+        )
 
         action_distr = self.action_distr
 
@@ -623,7 +752,7 @@ class Agent(Module):
 
         # sample actions from current policy and derive log probs
 
-        dist, _ = self.actor(actor_states, time_hiddens = time_hiddens, skill_groups = skill_groups, return_action_distr = True)
+        dist, _ = self.actor(actor_states, time_hiddens = time_hiddens, skill_groups = skill_groups, return_action_distr = True, action = actions, mask = mask)
 
         log_probs = self.actor.action_distr.log_prob(dist, actions)
         entropy = reduce(dist.entropy(), '... d -> ...', 'sum')
@@ -644,7 +773,9 @@ class Agent(Module):
 
         policy_loss = policy_loss - entropy * entropy_weight
 
-        return masked_mean(policy_loss, mask)
+        # next latent prediction loss (SPR / NLP), automatically enacted when the actor's head is wrapped
+
+        return masked_mean(policy_loss, mask) + self.actor.next_latent_prediction_loss
 
     def critic_loss(
         self,
@@ -1139,9 +1270,8 @@ class MotionPrior(Module):
     def forward(self, states):
         return self.discriminator(states)
 
-# phase conditional motion prior (section v-c2, equation 12)
-# the amp prior switches between the locomotion and skill discriminators
-# once the robot passes the prior transition position ahead of the obstacle, driving the handoff
+# phase conditional motion prior - switches between locomotion / skill discriminators at transition positions (equation 12)
+# https://arxiv.org/abs/2608.02653 - "Light-Loco-Parkour: Versatile Perceptive Whole-Body Locomotion via Multi-Skill Distillation" - Chen et al.
 
 class PhaseConditionalMotionPrior(Module):
     def __init__(
@@ -1238,9 +1368,7 @@ class PhaseConditionalMotionPrior(Module):
         return -diff(switches, dim = -1)
 
     def auto_positions(self, num_steps, prior_transition_positions = None):
-        # when positions are not given, assume the time steps traverse the track uniformly,
-        # from the start of the track to one trigger-spacing past the last transition, so
-        # every phase is visited
+        # no positions given - assume steps traverse the track uniformly so every phase is visited
 
         triggers = default(prior_transition_positions, self.prior_transition_positions)
         assert exists(triggers), 'automatic positions need prior_transition_positions to span the track'

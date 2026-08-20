@@ -5,6 +5,7 @@ from light_loco_parkour.light_loco_parkour import (
     DistillationWrapper,
     LightLocoParkour,
     StateEncoder,
+    NextLatentPredictionWrapper,
     OneHot,
     Gaussian,
     Beta,

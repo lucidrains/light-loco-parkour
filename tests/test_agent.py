@@ -303,12 +303,12 @@ def test_ppo_learning():
 
     agent = Agent(actor, critic)
 
-    images = torch.randn(2, 3, 2, 2)
-    proprio = torch.randn(2, 3, 5)
-    actions = torch.randn(2, 3, 21)
-    old_log_probs = torch.randn(2, 3)
-    advantages = torch.randn(2, 3)
-    returns = torch.rand(2, 3)
+    images = torch.randn(2, 8, 2, 2)
+    proprio = torch.randn(2, 8, 5)
+    actions = torch.randn(2, 8, 21)
+    old_log_probs = torch.randn(2, 8)
+    advantages = torch.randn(2, 8)
+    returns = torch.rand(2, 8)
 
     policy_loss = agent.actor_loss((images, proprio), actions, old_log_probs, advantages)
     value_loss = agent.critic_loss((images, proprio), returns)

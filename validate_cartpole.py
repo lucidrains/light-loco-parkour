@@ -15,7 +15,7 @@
 from collections import deque
 
 import torch
-from torch import tensor, cat
+from torch import tensor, cat, stack
 from torch.utils.data import TensorDataset, DataLoader
 from torch.nn.utils import clip_grad_norm_
 from torch.optim import AdamW
@@ -27,7 +27,7 @@ from einops import rearrange
 
 from env_ssl_wrapper import compose_env
 
-from light_loco_parkour import Agent, Actor, Critic, StateEncoder, Beta
+from light_loco_parkour import Agent, Actor, Critic, StateEncoder, Beta, exists
 
 # environment - one line normalizes any sim env to the same torch-native,
 # vectorized interface
@@ -169,8 +169,8 @@ def collect_trajectory(
     value_list.append(bootstrap)
 
     return dict(
-        obs = cat([rearrange(o, 'b d -> b 1 d') for o in obs_list]),
-        actions = cat([rearrange(a, 'b d -> b 1 d') for a in action_list]),
+        obs = stack(obs_list, dim = 1),
+        actions = stack(action_list, dim = 1),
         rewards = cat([r.unsqueeze(1) for r in reward_list], dim = 1),
         values = cat([v.unsqueeze(1) for v in value_list], dim = 1),
         log_probs = cat([lp.unsqueeze(1) for lp in log_prob_list], dim = 1),
@@ -207,20 +207,29 @@ def ppo_update(
     ppo_epochs,
     batch_size,
     entropy_weight,
-    max_grad_norm
+    max_grad_norm,
+    keep_time = False
 ):
-    obs = rearrange(rollout['obs'], 'b t d -> (b t) 1 d')
-    actions = rearrange(rollout['actions'], 'b t d -> (b t) d')
-    old_log_probs = rearrange(rollout['log_probs'], 'b t -> (b t) 1')
-    advantages = rearrange(rollout['advantages'], 'b t -> (b t) 1')
-    returns = rearrange(rollout['returns'], 'b t -> (b t) 1')
-    mask = rearrange(rollout['mask'], 'b t -> (b t) 1')
+    fields = ('obs', 'actions', 'log_probs', 'advantages', 'returns', 'mask')
+    obs, actions, log_probs, advantages, returns, mask = [rollout[k] for k in fields]
 
-    dataset = TensorDataset(obs, actions, old_log_probs, advantages, returns, mask)
-    dataloader = DataLoader(dataset, batch_size = batch_size, shuffle = True)
+    if not keep_time:
+        obs = rearrange(obs, 'b t d -> (b t) 1 d')
+        actions = rearrange(actions, 'b t d -> (b t) d')
+        log_probs, advantages, returns, mask = (rearrange(t, 'b t -> (b t) 1') for t in (log_probs, advantages, returns, mask))
+
+        make_batches = lambda: iter(DataLoader(TensorDataset(obs, actions, log_probs, advantages, returns, mask), batch_size = batch_size, shuffle = True))
+    else:
+        # keep the time dimension, batching over contiguous time blocks, so the
+        # next latent prediction pairs stay aligned
+
+        chunk = max(1, batch_size // obs.shape[0])
+        tensors = tuple(t[:, :t.shape[1] // chunk * chunk].reshape(*t.shape[:1], -1, chunk, *t.shape[2:]) for t in (obs, actions, log_probs, advantages, returns, mask))
+
+        make_batches = lambda: ((t[:, i] for t in tensors) for i in torch.randperm(tensors[0].shape[1]).tolist())
 
     for _ in range(ppo_epochs):
-        for batch_obs, batch_actions, batch_old_log_probs, batch_advantages, batch_returns, batch_mask in dataloader:
+        for batch_obs, batch_actions, batch_old_log_probs, batch_advantages, batch_returns, batch_mask in make_batches():
             states = dict(obs = batch_obs)
 
             policy_loss = agent.actor_loss(
@@ -312,7 +321,9 @@ def main(
     hl_gauss = True,
     symlog = False,
     min_conc = 0.,
-    obs_scale = (2.4, 3., 0.5, 4.)
+    obs_scale = (2.4, 3., 0.5, 4.),
+    next_latent_prediction = False, # spr / nlp next latent prediction on the actor's action head
+    next_latent_prediction_weight = 1.
 ):
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -336,7 +347,8 @@ def main(
         state_encoder = StateEncoder(64, dim_state = obs_dim, num_stacked_frames = 1),
         num_actions = num_actions,
         action_distr = Beta(min_conc = min_conc),
-        depth = 2
+        depth = 2,
+        next_latent_prediction = dict(loss_weight = next_latent_prediction_weight) if next_latent_prediction else None
     )
 
     # critic with hl gauss loss over a value support, or plain mse regression
@@ -384,13 +396,16 @@ def main(
             ppo_epochs = ppo_epochs,
             batch_size = batch_size,
             entropy_weight = entropy_weight,
-            max_grad_norm = max_grad_norm
+            max_grad_norm = max_grad_norm,
+            keep_time = next_latent_prediction
         )
 
         episode_rewards.extend(rollout['episode_rewards'])
         avg_reward = np.mean(episode_rewards)
 
-        print(f'iteration {iteration:3d} | avg episode reward {avg_reward:6.2f}')
+        spr_loss = actor.next_latent_prediction_loss.item() if next_latent_prediction else None
+
+        print(f'iteration {iteration:3d} | avg episode reward {avg_reward:6.2f}' + (f' | spr loss {spr_loss:.4f}' if exists(spr_loss) else ''))
 
         if eval_every > 0 and (iteration + 1) % eval_every == 0:
             print(f'evaluation | deterministic avg episode reward {evaluate(agent, env, preprocess):7.2f}')
