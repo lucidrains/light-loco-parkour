@@ -105,6 +105,8 @@ def collect_trajectory(
     obs, _ = reset_env(env)
     obs = preprocess(obs)
 
+    time_hiddens = None
+
     episode_rewards = torch.zeros(num_envs)
     episode_reward_list = []
 
@@ -121,7 +123,7 @@ def collect_trajectory(
         states = dict(obs = rearrange(obs_before, 'b d -> b 1 d'))
 
         with torch.no_grad():
-            (action, log_prob, _), (value, _) = agent(states, sample_action = True, return_log_prob = True)
+            (action, log_prob, time_hiddens), (value, _) = agent(states, sample_action = True, return_log_prob = True, time_hiddens = time_hiddens)
 
         action = rearrange(action, 'b 1 d -> b d')
         log_prob = rearrange(log_prob, 'b 1 -> b')
@@ -158,6 +160,7 @@ def collect_trajectory(
         if env.all_done:
             obs, _ = reset_env(env)
             obs = preprocess(obs)
+            time_hiddens = None
 
     # bootstrap the final obs with its predicted value, zeroed for envs already done
 
@@ -272,13 +275,15 @@ def evaluate(
     episode_rewards = torch.zeros(num_envs)
     episode_reward_list = []
 
+    time_hiddens = None
+
     for _ in range(max_steps):
         active = torch.from_numpy(env.active_mask).bool()
 
         states = dict(obs = rearrange(obs, 'b d -> b 1 d'))
 
         with torch.no_grad():
-            (action, _), _ = agent(states, deterministic = True)
+            (action, time_hiddens), _ = agent(states, deterministic = True, time_hiddens = time_hiddens)
 
         action = to_env_action(rearrange(action, 'b 1 d -> b d'), env, num_envs)
 
@@ -295,6 +300,7 @@ def evaluate(
         if env.all_done:
             obs, _ = reset_env(env)
             obs = preprocess(obs)
+            time_hiddens = None
 
         if len(episode_reward_list) >= num_episodes:
             break
@@ -323,7 +329,8 @@ def main(
     min_conc = 0.,
     obs_scale = (2.4, 3., 0.5, 4.),
     next_latent_prediction = False, # spr / nlp next latent prediction on the actor's action head
-    next_latent_prediction_weight = 1.
+    next_latent_prediction_weight = 1.,
+    use_rnn = True # recurrent student, as in the paper; hidden states are threaded through rollouts
 ):
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -344,7 +351,7 @@ def main(
 
     actor = Actor(
         64,
-        state_encoder = StateEncoder(64, dim_state = obs_dim, num_stacked_frames = 1),
+        state_encoder = StateEncoder(64, dim_state = obs_dim, num_stacked_frames = 1, use_rnn = use_rnn),
         num_actions = num_actions,
         action_distr = Beta(min_conc = min_conc),
         depth = 2,
@@ -397,7 +404,7 @@ def main(
             batch_size = batch_size,
             entropy_weight = entropy_weight,
             max_grad_norm = max_grad_norm,
-            keep_time = next_latent_prediction
+            keep_time = next_latent_prediction or use_rnn
         )
 
         episode_rewards.extend(rollout['episode_rewards'])

@@ -10,7 +10,7 @@ from torch import nn, cat, stack, einsum, is_tensor, tensor, diff, Tensor
 from torch.nn import Module, ModuleList, Linear, RMSNorm
 import torch.nn.functional as F
 
-import einx
+from einx import get_at, where, greater, subtract
 from einops import rearrange, repeat, reduce
 from einops.layers.torch import Rearrange
 
@@ -418,14 +418,19 @@ class NextLatentPredictionWrapper(Module):
         # forward dynamics: predict the residual (delta) update, applied via a residual
         # connection onto the current latent - equation 9 of the NLP paper:
         #   ĥ_{t + 1} = f_ψ(h_t, a_t) + h_t
+        # the time shifts gather along the time axis with einx get_at
 
-        action_embed = self.action_embedder(action[:, :-1])
+        t = x.shape[1]
+        time_index = torch.arange(t, device = x.device)
+        shift = lambda tensor, idx: get_at('b [t] d, p -> b p d', tensor, idx)
 
-        latent_pred = self.proj_head(x[:, :-1] + self.dynamics(cat((x[:, :-1], action_embed), dim = -1)))
+        action_embed = self.action_embedder(shift(action, time_index[:-1]))
+
+        latent_pred = self.proj_head(shift(x, time_index[:-1]) + self.dynamics(cat((shift(x, time_index[:-1]), action_embed), dim = -1)))
 
         # target is the next latent, detached, through the same projection head
 
-        target = self.proj_head(x[:, 1:].detach())
+        target = self.proj_head(shift(x.detach(), time_index[1:]))
 
         # 2 - 2 * cos = squared distance on unit sphere, bounded so the loss weight can't overwhelm
 
@@ -660,6 +665,10 @@ class Critic(Module):
 
 # agent - handles both inference and ppo learning for asymmetric actor / critic
 
+# kwargs shared with the critic on the combined agent forward pass; the rest are actor-only
+
+critic_forward_kwarg_names = ('time_hiddens', 'skill_groups', 'mask', 'target', 'return_logits')
+
 class Agent(Module):
     def __init__(
         self,
@@ -715,7 +724,13 @@ class Agent(Module):
         if n_values == n_steps:
             values = pad_right_at_dim(values, 1, value = 0.)
 
-        values, values_next = values[..., :-1], values[..., 1:]
+        # the time shifts gather along the time axis with einx get_at
+
+        t = values.shape[-1]
+        time_index = torch.arange(t, device = values.device)
+        shift = lambda tensor, idx: get_at('b [t], p -> b p', tensor, idx)
+
+        values, values_next = shift(values, time_index[:-1]), shift(values, time_index[1:])
 
         delta = rewards + gamma * values_next * masks - values
         gates = gamma * lam * masks
@@ -818,7 +833,10 @@ class Agent(Module):
         **kwargs
     ):
         actor_out = self.forward_actor(states, **kwargs)
-        critic_out = self.forward_critic(states)
+
+        critic_kwargs = {k: v for k, v in kwargs.items() if k in critic_forward_kwarg_names}
+        critic_out = self.forward_critic(states, **critic_kwargs)
+
         return actor_out, critic_out
 
 # distillation wrapper
@@ -942,10 +960,10 @@ class DistillationWrapper(Module):
         # maybe mask unreduced loss
 
         if exists(mask) and return_unreduced:
-            loss = einx.where('b t, b t ..., -> b t ...', mask, loss, 0.)
-            distill_loss = einx.where('b t, b t ..., -> b t ...', mask, distill_loss, 0.)
+            loss = where('b t, b t ..., -> b t ...', mask, loss, 0.)
+            distill_loss = where('b t, b t ..., -> b t ...', mask, distill_loss, 0.)
             if has_aux:
-                aux_loss = einx.where('b t, b t ..., -> b t ...', mask, aux_loss, 0.)
+                aux_loss = where('b t, b t ..., -> b t ...', mask, aux_loss, 0.)
 
         # return
 
@@ -986,6 +1004,8 @@ class RewardHyperParams:
     sigma_angular: float = 0.25
     slack_low: float = 0.3
     slack_high: float = 1.5
+    slack_commanded_floor: float = 0.1
+    slack_allow_reverse: bool = True
     footstep_threshold: float = 0.1
     contact_force_threshold: float = 1.
     foot_accel_threshold: float = 30.
@@ -1016,9 +1036,21 @@ def reward_velocity_slack(state: State, hparams: RewardHyperParams):
     forward_speed = state.linear_velocity[..., 0]
     commanded_speed = state.commanded_velocity[..., 0]
 
-    slow_enough = forward_speed >= hparams.slack_low * commanded_speed
-    fast_enough = forward_speed <= hparams.slack_high * commanded_speed
-    is_commanded = commanded_speed > 0.
+    # the paper's ratio formulation 1[v^c / v in [slack_low, slack_high]] is sign-symmetric: a
+    # reverse command rewards backward motion within the same band, and the ratio is undefined
+    # at a zero command. the bonus is therefore gated on a minimum commanded speed magnitude
+    # (slack_commanded_floor); slack_allow_reverse = False restores a forward-command-only bonus
+
+    if hparams.slack_allow_reverse:
+        is_commanded = commanded_speed.abs() >= hparams.slack_commanded_floor
+    else:
+        is_commanded = commanded_speed > 0.
+
+    denom = torch.where(is_commanded, commanded_speed, torch.ones_like(commanded_speed))
+    ratio = forward_speed / denom
+
+    slow_enough = ratio >= hparams.slack_low
+    fast_enough = ratio <= hparams.slack_high
 
     return (slow_enough & fast_enough & is_commanded).float()
 
@@ -1332,7 +1364,7 @@ class PhaseConditionalMotionPrior(Module):
 
         prior_transition_positions = self.resolve_transition_positions(prior_transition_positions, device = positions.device)
 
-        passed = einx.greater('b ... , n -> b ... n', positions, prior_transition_positions)
+        passed = greater('b ... , n -> b ... n', positions, prior_transition_positions)
         return reduce(passed, 'b ... n -> b ...', 'sum')
 
     def phase_weights(self, positions = None, prior_transition_positions = None, phases = None):
@@ -1354,7 +1386,7 @@ class PhaseConditionalMotionPrior(Module):
 
         prior_transition_positions = self.resolve_transition_positions(prior_transition_positions, device = positions.device)
 
-        switches = (einx.subtract('b ... , n -> b ... n', positions, prior_transition_positions) * self.handoff_temperature).sigmoid()
+        switches = (subtract('b ... , n -> b ... n', positions, prior_transition_positions) * self.handoff_temperature).sigmoid()
 
         phase_switch_shape = (*positions.shape, 1)
 

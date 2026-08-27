@@ -18,6 +18,7 @@ from light_loco_parkour.light_loco_parkour import (
     RewardShapingWrapper,
     StatefulReward,
     reward_linear_velocity_tracking,
+    reward_velocity_slack,
     Discriminator,
     MotionPrior,
     exists
@@ -399,6 +400,89 @@ def test_reward_weights_and_registration():
 
     wrapper.reset_()
     assert torch.allclose(wrapper(state), reward)
+
+def test_agent_combined_forward_routes_skill_groups_to_critic():
+    # the combined agent forward must pass the skill group conditioning to the critic, matching
+    # a standalone critic call with the same group, and differ across groups
+
+    actor = Actor(512, state_encoder = StateEncoder(512, dim_state = 4 + 5), num_skill_groups = 3, action_distr = Gaussian())
+    critic = Critic(512, state_encoder = StateEncoder(512, dim_state = 4 + 5), num_skill_groups = 3)
+
+    agent = Agent(actor, critic)
+
+    states = (torch.randn(2, 3, 4), torch.randn(2, 3, 5))
+
+    (actions, log_probs, _), (values, _) = agent(states, skill_groups = 2, sample_action = True, return_log_prob = True)
+
+    assert actions.shape == (2, 3, 21)
+    assert log_probs.shape == (2, 3)
+    assert values.shape == (2, 3)
+
+    standalone_values, _ = agent.forward_critic(states, skill_groups = 2)
+    other_group_values, _ = agent.forward_critic(states, skill_groups = 0)
+
+    assert torch.allclose(values, standalone_values)
+    assert not torch.allclose(values, other_group_values)
+
+def test_recurrent_rollout_hidden_state_threading():
+    # step-by-step inference that threads the hidden state must match a single full-sequence
+    # forward pass, so the recurrent student can be deployed one frame at a time
+
+    actor = Actor(
+        512,
+        state_encoder = StateEncoder(512, dim_state = 4 + 5, use_rnn = True, num_stacked_frames = 1),
+        action_distr = Gaussian()
+    )
+
+    images = torch.randn(1, 6, 2, 2)
+    proprio = torch.randn(1, 6, 5)
+
+    with torch.no_grad():
+        full_actions, _ = actor((images, proprio), deterministic = True)
+
+        step_actions = []
+        hidden = None
+
+        for t in range(proprio.shape[1]):
+            action, hidden = actor((images[:, t:t + 1], proprio[:, t:t + 1]), time_hiddens = hidden, deterministic = True)
+            step_actions.append(action)
+
+    assert torch.allclose(torch.cat(step_actions, dim = 1), full_actions, atol = 1e-4)
+
+def test_velocity_slack_reverse_commands():
+    # paper eq. 3 - 1[v^c / v in [slack_low, slack_high]] is sign-symmetric: reversing at half the
+    # commanded reverse speed earns the bonus, while opposing the command never does
+
+    hparams = RewardHyperParams()
+
+    def reward(cmd, cur):
+        state = State(
+            linear_velocity = torch.tensor([[cur, 0., 0.]]),
+            angular_velocity = torch.zeros(1, 3),
+            projected_gravity = torch.zeros(1, 3),
+            commanded_velocity = torch.tensor([[cmd, 0., 0.]]),
+            joint_limit_flags = torch.zeros(1, 21),
+            contact_forces = torch.zeros(1, 6),
+            foot_contact = torch.zeros(1, 2),
+            foot_heights = torch.zeros(1, 2),
+            foot_ray_hit_heights = torch.zeros(1, 2, 8),
+            foot_acceleration = torch.zeros(1, 2, 3),
+            heading_error = torch.zeros(1),
+            action_rate = torch.zeros(1, 21)
+        )
+        return reward_velocity_slack(state, hparams).item()
+
+    assert reward(1., 0.5) == 1.    # forward command, half speed
+    assert reward(-1., -0.5) == 1.  # reverse command, half speed
+    assert reward(-1., -2.0) == 0.  # reversing too fast
+    assert reward(-1., 0.5) == 0.   # moving against the command
+    assert reward(0., 0.0) == 0.    # zero command - the ratio is undefined
+    assert reward(0.05, 0.03) == 0. # below the commanded-speed floor
+
+    # forward-only mode restores the previous behavior
+
+    hparams.slack_allow_reverse = False
+    assert reward(-1., -0.5) == 0.
 
 def test_stateful_state_not_shared():
     wrapper_a = RewardShapingWrapper(reward_hparams = RewardHyperParams())
