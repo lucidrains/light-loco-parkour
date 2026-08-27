@@ -16,6 +16,17 @@ Implementation of [Light Loco Parkour](https://light-loco-parkour.github.io/), V
 ```
 
 ```bibtex
+@inproceedings{
+    mysore2022multicritic,
+    title  = {Multi-Critic Actor Learning: Teaching {RL} Policies to Act with Style},
+    author = {Siddharth Mysore and George Cheng and Yunqi Zhao and Kate Saenko and Meng Wu},
+    booktitle = {International Conference on Learning Representations},
+    year   = {2022},
+    url    = {https://openreview.net/forum?id=rJvY_5OzoI}
+}
+```
+
+```bibtex
 @article{zhao2025knowledge,
     author  = {Zhao, Rui and Fan, Yuze and Li, Yun and Zhang, Dong and Gao, Fei and Gao, Zhenhai and Yang, Zhengcai},
     title   = {Knowledge Distillation-Enhanced Behavior Transformer for Decision-Making of Autonomous Driving},

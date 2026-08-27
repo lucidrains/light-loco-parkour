@@ -185,7 +185,7 @@ def collect_trajectory(
 # generalized advantage estimation
 
 def compute_gae(
-    calc_gae_fn,
+    agent,
     rollout,
     *,
     gamma,
@@ -195,8 +195,11 @@ def compute_gae(
     values = rollout['values']
     masks = 1. - rollout['dones'].float()
 
-    returns = calc_gae_fn(rewards, values, masks, gamma = gamma, lam = gae_lambda)
-    advantages = returns - values[..., :-1]
+    returns = agent.calc_gae(rewards, values, masks, gamma = gamma, lam = gae_lambda)
+
+    # grouped weighted advantages - a single group of weight 1. is the standard z-scored gae
+
+    advantages = agent.calc_advantages(values[:, :-1], returns, mask = rollout['mask'])
 
     return advantages, returns
 
@@ -219,7 +222,8 @@ def ppo_update(
     if not keep_time:
         obs = rearrange(obs, 'b t d -> (b t) 1 d')
         actions = rearrange(actions, 'b t d -> (b t) d')
-        log_probs, advantages, returns, mask = (rearrange(t, 'b t -> (b t) 1') for t in (log_probs, advantages, returns, mask))
+        log_probs, advantages, mask = (rearrange(t, 'b t -> (b t) 1') for t in (log_probs, advantages, mask))
+        returns = rearrange(returns, 'b t ... -> (b t) 1 ...')
 
         make_batches = lambda: iter(DataLoader(TensorDataset(obs, actions, log_probs, advantages, returns, mask), batch_size = batch_size, shuffle = True))
     else:
@@ -390,7 +394,7 @@ def main(
 
         # generalized advantage estimation
 
-        advantages, returns = compute_gae(agent.calc_gae, rollout, gamma = gamma, gae_lambda = gae_lambda)
+        advantages, returns = compute_gae(agent, rollout, gamma = gamma, gae_lambda = gae_lambda)
 
         rollout.update(advantages = advantages, returns = returns)
 

@@ -5,6 +5,8 @@ import torch
 from torch import tensor
 from torch.nn import Module
 
+from torch_einops_utils import z_score
+
 from x_mlps_pytorch import create_mlp
 from light_loco_parkour.light_loco_parkour import (
     Actor,
@@ -18,7 +20,9 @@ from light_loco_parkour.light_loco_parkour import (
     RewardShapingWrapper,
     StatefulReward,
     reward_linear_velocity_tracking,
+    reward_angular_velocity_tracking,
     reward_velocity_slack,
+    reward_heading_error,
     Discriminator,
     MotionPrior,
     exists
@@ -344,7 +348,6 @@ def test_reward_shaping():
 
     reward = wrapper(state)
     assert reward.shape == (4,)
-
     reward.sum().backward()
     assert exists(state.linear_velocity.grad)
 
@@ -546,3 +549,201 @@ def test_motion_prior():
     no_gp = MotionPrior(Discriminator(512, dim_in = 64), use_grad_penalty = False)
     loss, (bce_loss, grad_penalty) = no_gp.discriminator_loss(real, fake, return_loss_breakdown = True)
     assert torch.allclose(loss, bce_loss) and grad_penalty == 0.
+
+# grouped weighted advantages (Mysore et al., ICLR 2022) - one critic head per
+# reward group, each group's advantage z-scored across the batch and weighted
+
+def test_grouped_reward_wrapper():
+    state = mock_state()
+
+    # a flat config coerces to a single group of weight 1., the flat reward exactly
+
+    wrapper = RewardShapingWrapper(reward_hparams = RewardHyperParams())
+
+    assert wrapper.group_names == ('total',)
+    assert torch.allclose(wrapper.group_weights, tensor([1.]))
+
+    reward = wrapper(state)
+    assert reward.shape == (4,)
+
+    # grouped config - one scalar per reward group, the group weight not baked in
+
+    groups = (
+        ('tracking', 2.0, (
+            (reward_linear_velocity_tracking, 2.0),
+            (reward_angular_velocity_tracking, 2.0),
+        )),
+        ('safety', 0.5, (
+            (reward_velocity_slack, 1.5),
+            (reward_heading_error, -1.0),
+        )),
+    )
+
+    wrapper = RewardShapingWrapper(reward_fns = groups, stateful_reward_fns = (), reward_hparams = RewardHyperParams())
+
+    assert wrapper.group_names == ('tracking', 'safety')
+    assert torch.allclose(wrapper.group_weights, tensor([2.0, 0.5]))
+
+    grouped_rewards = wrapper(state)
+    assert grouped_rewards.shape == (4, 2)
+
+    # per-group sums match computing the group terms by hand
+
+    tracking_manual = reward_linear_velocity_tracking(state, wrapper.reward_hparams) * 2.0 + reward_angular_velocity_tracking(state, wrapper.reward_hparams) * 2.0
+    assert torch.allclose(grouped_rewards[:, 0], tracking_manual)
+
+    safety_manual = reward_velocity_slack(state, wrapper.reward_hparams) * 1.5 + reward_heading_error(state, wrapper.reward_hparams) * -1.0
+    assert torch.allclose(grouped_rewards[:, 1], safety_manual)
+
+    # per-reward weight overrides still apply within groups
+
+    wrapper.reward_weights['reward_heading_error'] = -3.0
+    assert torch.allclose(wrapper(state)[:, 1], safety_manual - 2.0 * state.heading_error)
+
+    # runtime registration into an explicit group
+
+    def reward_base_height(state, hparams):
+        return state.heading_error
+
+    wrapper.add_reward_function_(reward_base_height, 5., group_name = 'safety')
+    assert torch.allclose(wrapper(state)[:, 1], safety_manual - 2.0 * state.heading_error + state.heading_error * 5.)
+
+    # adding a function without a group name is an error with multiple groups
+
+    with pytest.raises(AssertionError):
+        wrapper.add_reward_function_(reward_base_height, 1.)
+
+def test_grouped_critic():
+    num_groups = 3
+
+    critic = Critic(512, state_encoder = StateEncoder(512, dim_state = 4 + 5), num_value_heads = num_groups)
+
+    images = torch.randn(2, 8, 2, 2)
+    proprio = torch.randn(2, 8, 5)
+
+    values, _ = critic((images, proprio))
+    assert values.shape == (2, 8, num_groups)
+
+    # per-group value targets - each head trains on its own group's returns
+
+    returns = torch.rand(2, 8, num_groups)
+    value_loss, _ = critic((images, proprio), target = returns)
+    assert value_loss.ndim == 0
+    value_loss.backward()
+
+    assert all(exists(p.grad) for p in critic.parameters())
+
+    # a single head still returns flat values
+
+    flat_critic = Critic(512, state_encoder = StateEncoder(512, dim_state = 4 + 5))
+    flat_values, _ = flat_critic((images, proprio))
+    assert flat_values.shape == (2, 8)
+
+def test_grouped_calc_gae():
+    # per-group gae with trailing reward-group dims, independent per group
+
+    rewards = torch.randn(2, 16, 3)
+    values = torch.randn(2, 16, 3)
+    masks = torch.ones(2, 16)
+
+    returns = Agent.calc_gae(rewards, values, masks, gamma = 0.99, lam = 0.95)
+    assert returns.shape == (2, 16, 3)
+
+    # each group matches an independently computed flat gae
+
+    for group in range(3):
+        flat_returns = Agent.calc_gae(rewards[..., group], values[..., group], masks, gamma = 0.99, lam = 0.95)
+        assert torch.allclose(returns[..., group], flat_returns)
+
+    # bootstrapped values with an extra step
+
+    bootstrap_returns = Agent.calc_gae(rewards, torch.randn(2, 17, 3), masks)
+    assert bootstrap_returns.shape == (2, 16, 3)
+
+def test_grouped_weighted_advantages():
+    actor = Actor(512, state_encoder = StateEncoder(512, dim_state = 4 + 5), action_distr = Gaussian())
+    critic = Critic(512, state_encoder = StateEncoder(512, dim_state = 4 + 5), num_value_heads = 2)
+
+    agent = Agent(actor, critic, group_weights = (0.5, 2.0))
+
+    values = torch.randn(2, 8, 2)
+    returns = torch.randn(2, 8, 2)
+
+    advantages = agent.calc_advantages(values, returns)
+
+    # per-group gae, each z-scored across the batch, weighted and summed
+
+    expected = (
+        z_score(returns[..., 0] - values[..., 0]) * 0.5 +
+        z_score(returns[..., 1] - values[..., 1]) * 2.0
+    )
+    assert torch.allclose(advantages, expected)
+
+    # each group is z-scored on its own scale - rescaling one group changes no other
+
+    rescaled_returns = returns.clone()
+    rescaled_returns[..., 1] *= 100.
+    rescaled_values = values.clone()
+    rescaled_values[..., 1] *= 100.
+    assert torch.allclose(agent.calc_advantages(rescaled_values, rescaled_returns), advantages, atol = 1e-3)
+
+    # masked batches
+
+    mask = torch.tensor([[1, 1, 1, 1, 1, 1, 1, 1], [1, 1, 1, 0, 0, 0, 0, 0]]).bool()
+    masked_advantages = agent.calc_advantages(values, returns, mask = mask)
+    assert masked_advantages.shape == (2, 8)
+
+    # a single group of weight 1. reduces to the standard z-scored advantage
+
+    flat_agent = Agent(actor, Critic(512, state_encoder = StateEncoder(512, dim_state = 4 + 5)))
+    assert torch.allclose(flat_agent.group_weights, tensor([1.]))
+
+    flat_values = torch.randn(2, 8)
+    flat_returns = torch.randn(2, 8)
+    flat_advantages = flat_agent.calc_advantages(flat_values, flat_returns)
+    assert torch.allclose(flat_advantages, z_score(flat_returns - flat_values))
+
+def test_grouped_agent_learning():
+    num_groups = 2
+
+    actor = Actor(512, state_encoder = StateEncoder(512, dim_state = 4 + 5), action_distr = Gaussian())
+    critic = Critic(512, state_encoder = StateEncoder(512, dim_state = 4 + 5), num_value_heads = num_groups)
+
+    agent = Agent(actor, critic, group_weights = (2.0, 0.5))
+
+    images = torch.randn(2, 8, 2, 2)
+    proprio = torch.randn(2, 8, 5)
+    actions = torch.randn(2, 8, 21)
+    old_log_probs = torch.randn(2, 8)
+    advantages = torch.randn(2, 8)
+    returns = torch.rand(2, 8, num_groups)
+
+    policy_loss = agent.actor_loss((images, proprio), actions, old_log_probs, advantages)
+    value_loss = agent.critic_loss((images, proprio), returns)
+    loss = policy_loss + value_loss
+
+    loss.backward()
+
+    assert all(exists(p.grad) for p in actor.parameters())
+    assert all(exists(p.grad) for p in critic.parameters())
+
+def test_grouped_gae_to_advantages_flow():
+    # mirrors the training loop: per-group rewards -> per-group gae -> grouped weighted advantages
+
+    num_groups = 2
+
+    actor = Actor(512, state_encoder = StateEncoder(512, dim_state = 4 + 5), action_distr = Gaussian())
+    critic = Critic(512, state_encoder = StateEncoder(512, dim_state = 4 + 5), num_value_heads = num_groups)
+
+    agent = Agent(actor, critic, group_weights = (1.5, 1.0))
+
+    rewards = torch.randn(2, 12, num_groups)
+    values = torch.randn(2, 13, num_groups) # includes the bootstrap step
+    masks = torch.ones(2, 12)
+    rollout_mask = torch.ones(2, 12).bool()
+
+    returns = agent.calc_gae(rewards, values, masks)
+    assert returns.shape == (2, 12, num_groups)
+
+    advantages = agent.calc_advantages(values[:, :-1], returns, mask = rollout_mask)
+    assert advantages.shape == (2, 12)

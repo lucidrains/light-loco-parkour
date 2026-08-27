@@ -1,5 +1,6 @@
 from __future__ import annotations
 import math
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Sequence
 from beartype import beartype
@@ -606,7 +607,8 @@ class Critic(Module):
         min_value = -1.,
         max_value = 1.,
         num_bins = 2,
-        use_symlog = False
+        use_symlog = False,
+        num_value_heads = 1, # one value head per reward group (grouped weighted advantages, Mysore et al. 2022)
     ):
         super().__init__()
         self.state_encoder = state_encoder
@@ -615,7 +617,7 @@ class Critic(Module):
 
         self.backbone = create_mlp(dim, dim_in = self.skill_cond.dim_cond + dim, depth = depth)
 
-        # mse regression or hl gauss value prediction
+        # mse regression or hl gauss value prediction, one head per value group
 
         hl_gauss_loss = dict(
             min_value = min_value,
@@ -624,13 +626,16 @@ class Critic(Module):
             use_symlog = use_symlog
         )
 
-        self.use_regression = use_regression
+        self.num_value_heads = num_value_heads
 
-        self.hl_gauss_layer = HLGaussLayer(
-            dim,
-            use_regression = use_regression,
-            hl_gauss_loss = hl_gauss_loss
-        )
+        self.hl_gauss_layers = ModuleList([
+            HLGaussLayer(
+                dim,
+                use_regression = use_regression,
+                hl_gauss_loss = hl_gauss_loss
+            )
+            for _ in range(num_value_heads)
+        ])
 
     def forward(
         self,
@@ -657,9 +662,26 @@ class Critic(Module):
 
         embed = self.backbone(time_encoded_states)
 
-        # value prediction (mse regression) or hl gauss classification over value bins
+        # one value head per reward group - a grouped target trains each head on
+        # its own stream, a flat target broadcasts to every head
 
-        values = self.hl_gauss_layer(embed, target, mask = mask, return_logits = return_logits)
+        if exists(target) and target.ndim == 3:
+            assert target.shape[-1] == self.num_value_heads, f'number of grouped value targets must match the value heads: {target.shape[-1]} targets, {self.num_value_heads} heads'
+            targets = target.unbind(dim = -1)
+        else:
+            targets = cast_tuple(target, self.num_value_heads)
+
+        values = stack([
+            layer(embed, target_per_head, mask = mask, return_logits = return_logits)
+            for layer, target_per_head in zip(self.hl_gauss_layers, targets)
+        ], dim = -1)
+
+        # per-group value losses are averaged; a single head keeps the flat value output
+
+        if exists(target):
+            values = values.mean()
+        elif self.num_value_heads == 1:
+            values = values[..., 0]
 
         return values, next_time_hiddens
 
@@ -679,7 +701,8 @@ class Agent(Module):
         entropy_weight = 0.01,
         norm_advantages = True,
         actor_state_keys: tuple[str, ...] | None = None,
-        critic_state_keys: tuple[str, ...] | None = None
+        critic_state_keys: tuple[str, ...] | None = None,
+        group_weights: Tensor | Sequence[float] | None = None, # one weight per reward group
     ):
         super().__init__()
         self.actor = actor
@@ -693,6 +716,13 @@ class Agent(Module):
 
         self.actor_state_keys = actor_state_keys
         self.critic_state_keys = critic_state_keys
+
+        # grouped weighted advantages (Mysore et al., ICLR 2022) - each group's
+        # advantage z-scored independently, weighted and summed; a single group
+        # of weight 1. is the standard flat scheme
+
+        group_weights = cast_to_tensor(group_weights)
+        self.register_buffer('group_weights', default(group_weights, tensor(1.)), persistent = False)
 
     def route_states(
         self,
@@ -713,24 +743,28 @@ class Agent(Module):
         lam = 0.95,
         use_accelerated = None
     ):
-        n_steps = rewards.shape[-1]
-        n_values = values.shape[-1]
+        n_steps = rewards.shape[1]
+        n_values = values.shape[1]
 
         # values may be aligned with rewards (bootstrapping zero at the end),
-        # or hold one extra step carrying the bootstrap value of the next state
+        # or hold one extra bootstrap step; trailing reward-group dims are gae'd per group
 
         assert n_values in (n_steps, n_steps + 1)
 
         if n_values == n_steps:
-            values = pad_right_at_dim(values, 1, value = 0.)
+            values = pad_right_at_dim(values, 1, value = 0., dim = 1)
 
         # the time shifts gather along the time axis with einx get_at
 
-        t = values.shape[-1]
+        t = values.shape[1]
         time_index = torch.arange(t, device = values.device)
-        shift = lambda tensor, idx: get_at('b [t], p -> b p', tensor, idx)
+        shift = lambda tensor, idx: get_at('b [t] ..., p -> b p ...', tensor, idx)
 
         values, values_next = shift(values, time_index[:-1]), shift(values, time_index[1:])
+
+        # broadcast the mask over trailing reward-group dims
+
+        masks = pad_right_ndim_to(masks, rewards.ndim)
 
         delta = rewards + gamma * values_next * masks - values
         gates = gamma * lam * masks
@@ -742,6 +776,43 @@ class Agent(Module):
         returns = gae + values
 
         return returns
+
+    # grouped weighted advantage (Mysore et al., ICLR 2022) - each group's gae
+    # z-scored independently across the batch, weighted and summed, so no group
+    # can dominate the policy gradient
+
+    @torch.no_grad()
+    def calc_advantages(
+        self,
+        values: Tensor,
+        returns: Tensor, # per-group returns (value targets for the grouped critic)
+        *,
+        group_weights: Tensor | Sequence[float] | None = None,
+        mask: Tensor | None = None,
+        eps = 1e-5
+    ):
+        # per-group gae (returns - values), padded to a trailing group dim so the
+        # z-score below always runs over the full batch - flat inputs get one group
+
+        advantages = pad_right_ndim_to(returns - values, 3)
+
+        num_groups = advantages.shape[-1]
+
+        group_weights = default(group_weights, self.group_weights)
+        group_weights = cast_to_tensor(group_weights, device = advantages.device)
+
+        assert group_weights.numel() in (1, num_groups), f'need one group weight per reward group: {num_groups} groups, {group_weights.numel()} weights'
+
+        # a single scalar weight applies to every group
+
+        if group_weights.numel() == 1:
+            group_weights = group_weights.reshape(-1).expand(num_groups)
+
+        # z-score each group independently across the batch, then weighted sum
+
+        advantages = z_score(advantages, mask = mask, dim = tuple(range(advantages.ndim - 1)), eps = eps)
+
+        return einsum('... g, g -> ...', advantages, group_weights)
 
     # ppo losses
 
@@ -1096,6 +1167,32 @@ DEFAULT_REWARD_FNS = (
     (reward_action_rate, -0.1)
 )
 
+# reward groups for grouped weighted advantages (Mysore et al., ICLR 2022) - each
+# group's summed reward is one stream for a grouped critic head
+# grouped configs are ((name, group_weight, ((fn, weight), ...)), ...)
+
+def coerce_reward_groups(reward_fns):
+    # a flat ((fn, weight), ...) config coerces to a single group of weight 1.
+
+    is_flat = not reward_fns or all(callable(reward_fn[0]) for reward_fn in reward_fns)
+
+    if is_flat:
+        return (('total', 1., tuple(reward_fns)),)
+
+    return reward_fns
+
+def reward_fn_key(reward_fn):
+    # module instances (stateful rewards) are keyed by class name, plain functions by name
+
+    return reward_fn.__class__.__name__ if isinstance(reward_fn, Module) else reward_fn.__name__
+
+def index_reward_fn(indexed_group_rewards, reward_fn, weight):
+    # index a reward function by name into its group's dict, enforcing uniqueness
+
+    reward_fn_name = reward_fn_key(reward_fn)
+    assert reward_fn_name not in indexed_group_rewards, 'reward function names must be unique'
+    indexed_group_rewards[reward_fn_name] = (reward_fn, weight)
+
 class StatefulReward(Module):
     # reward function with state across calls
     def reset_(self):
@@ -1136,7 +1233,7 @@ def default_stateful_reward_fns():
 class RewardShapingWrapper(Module):
     def __init__(
         self,
-        reward_fns = DEFAULT_REWARD_FNS,
+        reward_fns = DEFAULT_REWARD_FNS, # flat ((fn, weight), ...) or grouped ((name, group_weight, ((fn, weight), ...)), ...)
         stateful_reward_fns = None,
         reward_weights: dict | None = None, # dict of fn name -> weight overrides
         reward_hparams: RewardHyperParams | None = None
@@ -1144,69 +1241,127 @@ class RewardShapingWrapper(Module):
         super().__init__()
         stateful_reward_fns = default(stateful_reward_fns, default_stateful_reward_fns())
 
-        self.reward_fns = {reward_fn.__name__: (reward_fn, weight) for reward_fn, weight in reward_fns}
-        self.stateful_reward_fns = {
-            reward_fn.__class__.__name__: (reward_fn, weight)
-            for reward_fn, weight in stateful_reward_fns
-        }
+        # group the reward functions (stateful ones included) - flat configs
+        # coerce into a single group of weight 1.
+
+        grouped_fns = coerce_reward_groups(reward_fns)
+
+        if stateful_reward_fns:
+            grouped_fns = [*grouped_fns, *coerce_reward_groups(stateful_reward_fns)]
+
+        self.reward_groups = self.group_reward_fns(grouped_fns)
+
         self.reward_weights = default(reward_weights, dict())
         self.reward_hparams = reward_hparams
         self.reset_()
 
+    @staticmethod
+    def group_reward_fns(reward_fns):
+        reward_groups = OrderedDict()
+
+        for group_name, group_weight, group_fns in reward_fns:
+            if group_name not in reward_groups:
+                reward_groups[group_name] = (group_weight, OrderedDict())
+
+            _, indexed_group_rewards = reward_groups[group_name]
+
+            for reward_fn, weight in group_fns:
+                index_reward_fn(indexed_group_rewards, reward_fn, weight)
+
+        return reward_groups
+
+    @property
+    def group_names(self):
+        return tuple(self.reward_groups.keys())
+
+    @property
+    def group_weights(self):
+        return tensor([group_weight for group_weight, _ in self.reward_groups.values()])
+
+    def resolve_group_name(self, group_name):
+        if exists(group_name):
+            assert group_name in self.reward_groups, f'unknown reward group {group_name}'
+            return group_name
+
+        assert len(self.reward_groups) == 1, 'group_name must be provided when there are multiple reward groups'
+        return next(iter(self.reward_groups))
+
     def add_reward_function_(
         self,
         reward_fn,
-        weight
+        weight,
+        group_name = None
     ):
-        reward_fn_name = reward_fn.__name__
-        assert reward_fn_name not in self.reward_fns, 'reward function names must be unique'
-        self.reward_fns[reward_fn_name] = (reward_fn, weight)
+        group_name = self.resolve_group_name(group_name)
+
+        _, indexed_group_rewards = self.reward_groups[group_name]
+
+        index_reward_fn(indexed_group_rewards, reward_fn, weight)
 
     def delete_reward_function_(
         self,
-        reward_fn_name
+        reward_fn_name,
+        group_name = None
     ):
-        assert reward_fn_name in self.reward_fns
-        del self.reward_fns[reward_fn_name]
+        group_name = self.resolve_group_name(group_name)
+
+        _, indexed_group_rewards = self.reward_groups[group_name]
+
+        assert reward_fn_name in indexed_group_rewards
+        del indexed_group_rewards[reward_fn_name]
 
     def add_stateful_reward_function_(
         self,
         reward_fn,
-        weight
+        weight,
+        group_name = None
     ):
-        reward_fn_name = reward_fn.__class__.__name__
-        assert reward_fn_name not in self.stateful_reward_fns, 'stateful reward function names must be unique'
-        self.stateful_reward_fns[reward_fn_name] = (reward_fn, weight)
+        self.add_reward_function_(reward_fn, weight, group_name = group_name)
 
     def delete_stateful_reward_function_(
         self,
-        reward_fn_name
+        reward_fn_name,
+        group_name = None
     ):
-        assert reward_fn_name in self.stateful_reward_fns
-        del self.stateful_reward_fns[reward_fn_name]
+        self.delete_reward_function_(reward_fn_name, group_name = group_name)
 
     def reset_(self):
-        for reward_fn, _ in self.stateful_reward_fns.values():
-            reward_fn.reset_()
+        for _, indexed_group_rewards in self.reward_groups.values():
+            for reward_fn, _ in indexed_group_rewards.values():
+                if isinstance(reward_fn, StatefulReward):
+                    reward_fn.reset_()
+
+    def compute_group_reward(self, indexed_group_rewards, state, reward_hparams):
+        # weighted sum of the group's reward terms, with per-reward weight overrides
+
+        total = 0.
+
+        for reward_fn_name, (reward_fn, weight) in indexed_group_rewards.items():
+            weight = self.reward_weights.get(reward_fn_name, weight)
+            total = total + reward_fn(state, reward_hparams) * weight
+
+        return total
 
     def forward(
         self,
         state: State,
         reward_hparams: RewardHyperParams | None = None
     ):
-        # section iv-c1 - weighted sum of reward terms
+        # section iv-c1 - weighted sum of reward terms, one scalar per reward group
 
         reward_hparams = default(reward_hparams, self.reward_hparams)
         assert exists(reward_hparams), 'reward hyperparameters must be provided'
 
-        total_reward = state.linear_velocity.new_zeros(state.linear_velocity.shape[0])
+        group_rewards = [
+            self.compute_group_reward(indexed_group_rewards, state, reward_hparams)
+            for _, indexed_group_rewards in self.reward_groups.values()
+        ]
 
-        for reward_fns in (self.reward_fns, self.stateful_reward_fns):
-            for reward_fn_name, (reward_fn, weight) in reward_fns.items():
-                weight = self.reward_weights.get(reward_fn_name, weight)
-                total_reward = total_reward + reward_fn(state, reward_hparams) * weight
+        group_rewards = stack(group_rewards, dim = -1)
 
-        return total_reward
+        # a single group returns the flat total reward, as before
+
+        return group_rewards[..., 0] if group_rewards.shape[-1] == 1 else group_rewards
 
 # motion prior (equation 12)
 
