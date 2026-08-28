@@ -98,7 +98,8 @@ def collect_trajectory(
     agent,
     env,
     preprocess,
-    steps_per_iter
+    steps_per_iter,
+    use_last_action = False
 ):
     num_envs = env.num_envs
 
@@ -106,6 +107,11 @@ def collect_trajectory(
     obs = preprocess(obs)
 
     time_hiddens = None
+
+    # [a_{t-1}, 0] - the last action plus a spare zero slot, so the actor can
+    # align to its single time step
+
+    past_action = torch.zeros(num_envs, 2, 1) if use_last_action else None
 
     episode_rewards = torch.zeros(num_envs)
     episode_reward_list = []
@@ -122,12 +128,20 @@ def collect_trajectory(
 
         states = dict(obs = rearrange(obs_before, 'b d -> b 1 d'))
 
+        actor_feed = dict(time_hiddens = time_hiddens)
+        if use_last_action:
+            actor_feed['past_actions'] = past_action
+
         with torch.no_grad():
-            (action, log_prob, time_hiddens), (value, _) = agent(states, sample_action = True, return_log_prob = True, time_hiddens = time_hiddens)
+            (action, log_prob, time_hiddens), (value, _) = agent(states, sample_action = True, return_log_prob = True, **actor_feed)
 
         action = rearrange(action, 'b 1 d -> b d')
         log_prob = rearrange(log_prob, 'b 1 -> b')
         value = rearrange(value, 'b 1 -> b')
+
+        if use_last_action:
+            past_action.zero_()
+            past_action[:, 0] = action
 
         raw_action = action
         action = to_env_action(action, env, num_envs)
@@ -161,6 +175,8 @@ def collect_trajectory(
             obs, _ = reset_env(env)
             obs = preprocess(obs)
             time_hiddens = None
+            if use_last_action:
+                past_action.zero_() # fresh episodes restart from zero history
 
     # bootstrap the final obs with its predicted value, zeroed for envs already done
 
@@ -269,7 +285,8 @@ def evaluate(
     env,
     preprocess,
     num_episodes = 32,
-    max_steps = 4096
+    max_steps = 4096,
+    use_last_action = False
 ):
     num_envs = env.num_envs
 
@@ -281,15 +298,27 @@ def evaluate(
 
     time_hiddens = None
 
+    past_action = torch.zeros(num_envs, 2, 1) if use_last_action else None
+
     for _ in range(max_steps):
         active = torch.from_numpy(env.active_mask).bool()
 
         states = dict(obs = rearrange(obs, 'b d -> b 1 d'))
 
-        with torch.no_grad():
-            (action, time_hiddens), _ = agent(states, deterministic = True, time_hiddens = time_hiddens)
+        actor_feed = dict(time_hiddens = time_hiddens)
+        if use_last_action:
+            actor_feed['past_actions'] = past_action
 
-        action = to_env_action(rearrange(action, 'b 1 d -> b d'), env, num_envs)
+        with torch.no_grad():
+            (action, time_hiddens), _ = agent(states, deterministic = True, **actor_feed)
+
+        raw_action = rearrange(action, 'b 1 d -> b d')
+
+        if use_last_action:
+            past_action.zero_()
+            past_action[:, 0] = raw_action
+
+        action = to_env_action(raw_action, env, num_envs)
 
         obs, reward, terminated, truncated, _ = env.step(action)
 
@@ -305,6 +334,8 @@ def evaluate(
             obs, _ = reset_env(env)
             obs = preprocess(obs)
             time_hiddens = None
+            if use_last_action:
+                past_action.zero_()
 
         if len(episode_reward_list) >= num_episodes:
             break
@@ -334,7 +365,8 @@ def main(
     obs_scale = (2.4, 3., 0.5, 4.),
     next_latent_prediction = False, # spr / nlp next latent prediction on the actor's action head
     next_latent_prediction_weight = 1.,
-    use_rnn = True # recurrent student, as in the paper; hidden states are threaded through rollouts
+    use_rnn = True, # recurrent student, as in the paper; hidden states are threaded through rollouts
+    actor_sees_past_action = False # condition the actor on the very past action (--actor-sees-past-action)
 ):
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -359,7 +391,8 @@ def main(
         num_actions = num_actions,
         action_distr = Beta(min_conc = min_conc),
         depth = 2,
-        next_latent_prediction = dict(loss_weight = next_latent_prediction_weight) if next_latent_prediction else None
+        next_latent_prediction = dict(loss_weight = next_latent_prediction_weight) if next_latent_prediction else None,
+        use_last_action = actor_sees_past_action
     )
 
     # critic with hl gauss loss over a value support, or plain mse regression
@@ -382,15 +415,15 @@ def main(
     max_steps = getattr(getattr(env, 'spec', None), 'max_episode_steps', None) or getattr(env, 'max_steps', 500)
     episode_rewards = deque(maxlen = 10)
 
-    print(f'training on {env_id} | {env.num_envs} parallel envs | {num_actions} action(s) | obs dim {obs_dim}')
+    print(f'training on {env_id} | {env.num_envs} parallel envs | {num_actions} action(s) | obs dim {obs_dim} | past action feedback {actor_sees_past_action}')
 
     if eval_every > 0:
-        print(f'evaluation | deterministic avg episode reward {evaluate(agent, env, preprocess):7.2f}')
+        print(f'evaluation | deterministic avg episode reward {evaluate(agent, env, preprocess, use_last_action = actor_sees_past_action):7.2f}')
 
     for iteration in range(max_iterations):
         # collect trajectory
 
-        rollout = collect_trajectory(agent, env, preprocess, steps_per_iter)
+        rollout = collect_trajectory(agent, env, preprocess, steps_per_iter, use_last_action = actor_sees_past_action)
 
         # generalized advantage estimation
 
@@ -408,7 +441,7 @@ def main(
             batch_size = batch_size,
             entropy_weight = entropy_weight,
             max_grad_norm = max_grad_norm,
-            keep_time = next_latent_prediction or use_rnn
+            keep_time = next_latent_prediction or use_rnn or actor_sees_past_action
         )
 
         episode_rewards.extend(rollout['episode_rewards'])
@@ -419,7 +452,7 @@ def main(
         print(f'iteration {iteration:3d} | avg episode reward {avg_reward:6.2f}' + (f' | spr loss {spr_loss:.4f}' if exists(spr_loss) else ''))
 
         if eval_every > 0 and (iteration + 1) % eval_every == 0:
-            print(f'evaluation | deterministic avg episode reward {evaluate(agent, env, preprocess):7.2f}')
+            print(f'evaluation | deterministic avg episode reward {evaluate(agent, env, preprocess, use_last_action = actor_sees_past_action):7.2f}')
 
         if avg_reward > min_reward:
             print(f'balanced cartpole for {avg_reward:.2f} / {max_steps} steps at iteration {iteration}')

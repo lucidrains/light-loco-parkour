@@ -747,3 +747,28 @@ def test_grouped_gae_to_advantages_flow():
 
     advantages = agent.calc_advantages(values[:, :-1], returns, mask = rollout_mask)
     assert advantages.shape == (2, 12)
+
+def test_last_action_conditioning_semantics():
+    torch.manual_seed(42)
+
+    actor = Actor(32, state_encoder = StateEncoder(32, dim_state = 4), num_actions = 1, action_distr = Beta(), depth = 2, use_last_action = True)
+
+    states = torch.randn(2, 5, 4)
+    past = torch.zeros(2, 5, 1)
+    past[:, 1:, 0] = 0.7
+
+    out_conditioned, _ = actor((states,), deterministic = True, past_actions = past)
+    out_plain, _ = actor((states,), deterministic = True)
+
+    # the very first action is encoded as zero - the encoded state passes through untouched
+
+    assert torch.allclose(out_conditioned[:, 0], out_plain[:, 0])
+    assert not torch.allclose(out_conditioned[:, 1:], out_plain[:, 1:])
+
+    # only the strictly previous action is in the window
+
+    past_shifted = torch.zeros(2, 5, 1)
+    past_shifted[:, 4, 0] = 0.9
+    out_shifted, _ = actor((states,), deterministic = True, past_actions = past_shifted)
+    out_zero, _ = actor((states,), deterministic = True, past_actions = torch.zeros(2, 5, 1))
+    assert torch.allclose(out_shifted, out_zero)

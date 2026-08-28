@@ -462,10 +462,14 @@ class Actor(Module):
         action_distr: Module | None = None,
         distr_dim_out = 2,
         aux_decoder: Module | None = None,
-        next_latent_prediction: bool | dict | Module | None = None
+        next_latent_prediction: bool | dict | Module | None = None,
+        use_last_action: bool = False
     ):
         super().__init__()
         self.state_encoder = state_encoder
+
+        self.num_actions = num_actions
+        self.use_last_action = use_last_action
 
         self.skill_cond = OneHot(num_skill_groups)
 
@@ -474,6 +478,10 @@ class Actor(Module):
         action_distr = default(action_distr, distr)
         self.action_distr = action_distr
         self.distr_dim_out = distr_dim_out
+
+        # last past action feedback - 2-layer mlp, residual-summed onto the encoded state
+
+        self.action_history_encoder = create_mlp(dim, depth = 2, dim_in = num_actions) if use_last_action else None
 
         self.aux_decoder = aux_decoder
 
@@ -510,6 +518,36 @@ class Actor(Module):
     def next_latent_prediction_loss(self):
         return default(getattr(self.to_actions, 'next_latent_prediction_loss', None), self.zero)
 
+    def maybe_add_action_history(
+        self,
+        time_encoded_states: Tensor,
+        past_actions: Tensor | None
+    ):
+        # the very last past action, residual-summed onto the encoded state
+
+        if not self.use_last_action or not exists(past_actions):
+            return time_encoded_states
+
+        time = time_encoded_states.shape[1]
+
+        slack = past_actions.shape[1] - time
+
+        assert past_actions.shape[-1] == self.num_actions, 'past_actions action dim must match num_actions'
+        assert slack >= 0, 'past_actions must not have fewer time steps than states'
+
+        # slot t reads the action at t - 1, with the leading slack slots being
+        # the extra depth of the streaming buffer
+
+        prev_action = pad_left_at_dim(past_actions, 1, dim = 1)[:, slack: slack + time]
+
+        action_embed = self.action_history_encoder(prev_action)
+
+        # the very first action does not exist - gate slot 0 to zero
+
+        has_history = (torch.arange(time, device = time_encoded_states.device) >= 1 - slack).float()
+
+        return time_encoded_states + action_embed * has_history[..., None]
+
     def forward(
         self,
         states: Sequence[Tensor],
@@ -523,11 +561,14 @@ class Actor(Module):
         aux_decoder_target: Tensor | None = None,
         action: Tensor | None = None,
         mask: Tensor | None = None,
-        next_latent_prediction: bool | None = None
+        next_latent_prediction: bool | None = None,
+        past_actions: Tensor | None = None
     ):
         aux_decoder = default(aux_decoder, self.aux_decoder)
 
         time_encoded_states, next_time_hiddens = self.state_encoder(states, time_hiddens)
+
+        time_encoded_states = self.maybe_add_action_history(time_encoded_states, past_actions)
 
         batch, time, _ = shape(time_encoded_states, 'b t ...')
 
@@ -838,7 +879,11 @@ class Agent(Module):
 
         # sample actions from current policy and derive log probs
 
-        dist, _ = self.actor(actor_states, time_hiddens = time_hiddens, skill_groups = skill_groups, return_action_distr = True, action = actions, mask = mask)
+        # the rollout policy saw the stored actions
+
+        past_actions = actions if self.actor.use_last_action else None
+
+        dist, _ = self.actor(actor_states, time_hiddens = time_hiddens, skill_groups = skill_groups, return_action_distr = True, action = actions, mask = mask, past_actions = past_actions)
 
         log_probs = self.actor.action_distr.log_prob(dist, actions)
         entropy = reduce(dist.entropy(), '... d -> ...', 'sum')
