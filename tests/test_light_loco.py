@@ -1,6 +1,8 @@
 # full pipeline e2e - exercises all modules: teacher / student actors, asymmetric critic,
 # distillation, reward shaping, amp motion prior, and ppo
 
+import math
+
 import torch
 from torch import cat, tensor
 from torch.optim import AdamW
@@ -28,6 +30,7 @@ from light_loco_parkour import (
     DistillationWrapper,
     LightLocoParkour,
     Gaussian,
+    Beta,
     State,
     RewardHyperParams,
     RewardShapingWrapper,
@@ -70,6 +73,41 @@ def mock_state(batch = BATCH, dim_joints = NUM_ACTIONS, num_rays = 8, num_links 
         heading_error = torch.rand(batch) * 0.1,
         action_rate = torch.randn(batch, dim_joints) * 0.1
     )
+
+# beta on (-1, 1) - tanh mean head, affine-shifted entropy and log probs
+
+def test_beta_distribution_shifted_range():
+    torch.manual_seed(42)
+
+    beta = Beta()
+    params = torch.randn(BATCH, NUM_ACTIONS, 2)
+    dist = beta(params)
+    base = dist.base_dist
+    log2 = math.log(2.)
+
+    # tanh mean and affine support
+
+    action = dist.sample()
+    assert (action > -1).all() and (action < 1).all()
+    assert dist.support.check(action).all()
+
+    mean = params[..., 0].tanh().clamp(min = -1. + beta.eps, max = 1. - beta.eps)
+    assert torch.allclose(beta.mean(params), mean)
+    assert torch.allclose(dist.base_dist.mean * 2. - 1., mean)
+
+    # y = 2x - 1: entropy gains log(2), log probs lose log(2)
+
+    recovered = (action + 1.) / 2.
+
+    assert torch.allclose(beta.entropy(dist, sum_action_dim = False), base.entropy() + log2)
+    assert torch.allclose(beta.log_prob(dist, action, sum_action_dim = False), base.log_prob(recovered) - log2)
+
+    # tanh saturation must preserve the unimodality floor
+
+    extreme = beta(tensor([[[-100., 0.], [100., 0.]]])).base_dist
+
+    assert (extreme.concentration1 > 1.).all()
+    assert (extreme.concentration0 > 1.).all()
 
 def test_full_pipeline_e2e():
     # 1. teacher (privileged height scan) and student (onboard depth, recurrent)

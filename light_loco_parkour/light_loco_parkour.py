@@ -36,7 +36,8 @@ from hl_gauss_pytorch import HLGaussLayer
 
 from assoc_scan import AssocScan
 
-from torch.distributions import Distribution, Normal, Beta as _Beta
+from torch.distributions import Distribution, Normal, Beta as _Beta, TransformedDistribution
+from torch.distributions.transforms import AffineTransform
 
 # helper functions
 
@@ -68,7 +69,33 @@ def l2norm(t, dim = -1, eps = 1e-12):
 
 # action distributions
 
-class Gaussian(Module):
+# base class defining the action distribution contract (entropy / log_prob)
+# accepts either raw distribution params or a torch Distribution
+
+class ActionDistr(Module):
+    def to_dist(self, params_or_dist):
+        return params_or_dist if isinstance(params_or_dist, Distribution) else self(params_or_dist)
+
+    def entropy(
+        self,
+        params_or_dist,
+        sum_action_dim = True
+    ):
+        dist = self.to_dist(params_or_dist)
+        entropy = dist.entropy()
+        return entropy.sum(dim = -1) if sum_action_dim else entropy
+
+    def log_prob(
+        self,
+        params_or_dist,
+        action,
+        sum_action_dim = True
+    ):
+        dist = self.to_dist(params_or_dist)
+        log_prob = dist.log_prob(action)
+        return log_prob.sum(dim = -1) if sum_action_dim else log_prob
+
+class Gaussian(ActionDistr):
     def __init__(
         self,
         param_type = 'log_std',
@@ -87,16 +114,6 @@ class Gaussian(Module):
 
     def mean(self, params):
         return params[..., 0]
-
-    def log_prob(
-        self,
-        params_or_dist,
-        action,
-        sum_action_dim = True
-    ):
-        dist = params_or_dist if isinstance(params_or_dist, Distribution) else self(params_or_dist)
-        log_prob = dist.log_prob(action)
-        return log_prob.sum(dim = -1) if sum_action_dim else log_prob
 
     def forward(self, params):
         pos_fn = self.pos_fn
@@ -124,9 +141,10 @@ class Gaussian(Module):
 
         return Normal(mean, std)
 
-# beta distribution policy - unimodal mean-concentration reparameterization
+# beta distribution policy - unimodal mean-concentration reparameterization on (-1, 1),
+# an affine shift of a unit-interval beta (y = 2x - 1)
 
-class Beta(Module):
+class Beta(ActionDistr):
     def __init__(
         self,
         pos_fn = 'softplus',
@@ -161,7 +179,18 @@ class Beta(Module):
         params
     ):
         raw_mean, _ = params.unbind(dim = -1)
-        return raw_mean.sigmoid().clamp(min = self.eps, max = 1. - self.eps)
+        return raw_mean.tanh().clamp(min = -1. + self.eps, max = 1. - self.eps)
+
+    def entropy(
+        self,
+        params_or_dist,
+        sum_action_dim = True
+    ):
+        # shifted beta entropy = base entropy + log(2), the affine jacobian
+
+        dist = self.to_dist(params_or_dist)
+        entropy = dist.base_dist.entropy() + math.log(2.)
+        return entropy.sum(dim = -1) if sum_action_dim else entropy
 
     def log_prob(
         self,
@@ -171,34 +200,30 @@ class Beta(Module):
         eps = None
     ):
         eps = default(eps, self.eps)
-        action = action.clamp(min = eps, max = 1. - eps)
-        dist = params_or_dist if isinstance(params_or_dist, Distribution) else self(params_or_dist)
+        action = action.clamp(min = -1. + eps, max = 1. - eps)
+        dist = self.to_dist(params_or_dist)
         log_prob = dist.log_prob(action)
         return log_prob.sum(dim = -1) if sum_action_dim else log_prob
 
     def forward(self, params):
-        raw_mean, raw_conc = params.unbind(dim = -1)
+        _, raw_conc = params.unbind(dim = -1)
 
-        # mean mapped to (0, 1), clamped so the concentration parameters stay positive
+        # map (-1, 1) mean onto the unit interval
 
-        mean = raw_mean.sigmoid().clamp(min = self.eps, max = 1. - self.eps)
-
-        # positive concentration
+        mean = self.mean(params)
+        m = (mean + 1.) / 2.
 
         conc = self.concentration(raw_conc)
 
-        # concentration floor for unimodality (alpha > 1 and beta > 1), keeping the mean exact
-        # alpha = mean * conc > 1 and beta = (1 - mean) * conc > 1 need conc > 1 / min(mean, 1 - mean)
+        # keep the beta unimodal without changing its mean
 
-        min_mean = torch.minimum(mean, 1. - mean).clamp(min = self.eps)
-        conc = conc + 1. / min_mean
+        min_m = torch.minimum(m, 1. - m).clamp(min = self.eps / 2.)
+        conc = conc + 1. / min_m
 
-        # convert to beta distribution with exact mean = mean
+        alpha = m * conc
+        beta = (1. - m) * conc
 
-        alpha = mean * conc
-        beta = (1. - mean) * conc
-
-        return _Beta(alpha, beta)
+        return TransformedDistribution(_Beta(alpha, beta), AffineTransform(loc = -1., scale = 2.))
 
 # one hot helper module
 
@@ -476,6 +501,7 @@ class Actor(Module):
         self.backbone = create_mlp(dim, dim_in = self.skill_cond.dim_cond + dim, depth = depth)
 
         action_distr = default(action_distr, distr)
+        assert not exists(action_distr) or isinstance(action_distr, ActionDistr), 'action_distr must subclass ActionDistr (entropy / log_prob / forward contract)'
         self.action_distr = action_distr
         self.distr_dim_out = distr_dim_out
 
@@ -648,7 +674,6 @@ class Critic(Module):
         min_value = -1.,
         max_value = 1.,
         num_bins = 2,
-        use_symlog = False,
         num_value_heads = 1, # one value head per reward group (grouped weighted advantages, Mysore et al. 2022)
     ):
         super().__init__()
@@ -663,8 +688,7 @@ class Critic(Module):
         hl_gauss_loss = dict(
             min_value = min_value,
             max_value = max_value,
-            num_bins = num_bins,
-            use_symlog = use_symlog
+            num_bins = num_bins
         )
 
         self.num_value_heads = num_value_heads
@@ -886,7 +910,8 @@ class Agent(Module):
         dist, _ = self.actor(actor_states, time_hiddens = time_hiddens, skill_groups = skill_groups, return_action_distr = True, action = actions, mask = mask, past_actions = past_actions)
 
         log_probs = self.actor.action_distr.log_prob(dist, actions)
-        entropy = reduce(dist.entropy(), '... d -> ...', 'sum')
+        entropy = self.actor.action_distr.entropy(dist, sum_action_dim = False)
+        entropy = reduce(entropy, '... d -> ...', 'sum')
 
         # maybe normalize advantages (masked z-score)
 

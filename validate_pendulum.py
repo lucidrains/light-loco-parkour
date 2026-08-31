@@ -1,16 +1,12 @@
 # /// script
 # dependencies = [
-#   "env-ssl-wrapper>=0.1.0",
+#   "env-ssl-wrapper>=0.1.14",
 #   "gymnasium>=1.3.0",
 #   "fire>=0.7.1",
 # ]
 # ///
 
-# ppo sanity check for the beta mean-concentration action distribution.
-# the env goes through env-ssl-wrapper's compose_env, so the identical training
-# loop runs on any simulator env - gymnasium (default CartPole-v1), isaacgym
-# (--env_id isaacgym, a dependency-free mock, or module:attr for a real env
-# factory), etc.
+# ppo sanity check for the beta action distribution on pendulum
 
 from collections import deque
 
@@ -29,18 +25,14 @@ from env_ssl_wrapper import compose_env
 
 from light_loco_parkour import Agent, Actor, Critic, StateEncoder, Beta, exists
 
-# environment - one line normalizes any sim env to the same torch-native,
-# vectorized interface
+# env - one wrapper to a torch native vectorized interface
 
 def build_env(
     env_id,
     num_envs = 1,
     device = 'cpu'
 ):
-    if env_id == 'isaacgym':
-        from env_ssl_wrapper.mocks import IsaacMockEnv
-        env = IsaacMockEnv()
-    elif ':' in env_id:
+    if ':' in env_id:
         import importlib
         module_path, attr = env_id.split(':', 1)
         factory = getattr(importlib.import_module(module_path), attr)
@@ -51,10 +43,10 @@ def build_env(
     return compose_env(
         env,
         ('tensor', dict(device = device)),   # obs / rewards / dones as torch
-        'flatten_obs',                       # dict obs (isaacgym) -> flat vector
+        'flatten_obs',                       # dict obs -> flat vector
         'auto_batch',                        # single envs get a leading batch dim
         'done_tracker',                      # per-env episode lengths, active mask, all_done
-        ('action_transform', dict(auto = True)) # beta actions in [0, 1] -> env action bounds
+        ('action_transform', dict(auto = True, from_range = (-1., 1.))) # beta actions in [-1, 1] -> env action bounds
     )
 
 def reset_env(env, seed = None):
@@ -67,8 +59,7 @@ def reset_env(env, seed = None):
     return env.reset()
 
 def build_preprocess(obs_scale):
-    # divide by a per-dimension scale when it matches the obs dim (cartpole),
-    # otherwise leave the obs untouched (any other env)
+    # divide by per-dim scale when dims match, else pass through
 
     if obs_scale is None:
         return lambda obs: obs
@@ -81,16 +72,9 @@ def build_preprocess(obs_scale):
     return preprocess
 
 def to_env_action(action, env, num_envs):
-    # beta actions live in [0, 1]; binary discrete envs map them to {0, 1},
-    # continuous envs get them rescaled to their bounds by the action_transform wrapper
+    # beta actions in [-1, 1] -> env action bounds
 
-    if not hasattr(env.action_space, 'n'):
-        return action
-
-    assert env.action_space.n == 2, 'the beta action distribution is one dimensional, so only binary discrete action spaces are supported'
-
-    action = (action > 0.5).long().reshape(-1)
-    return action.item() if num_envs == 1 else action
+    return action.reshape(-1) if num_envs == 1 else action.reshape(num_envs, -1)
 
 # rollout collection
 
@@ -108,21 +92,19 @@ def collect_trajectory(
 
     time_hiddens = None
 
-    # [a_{t-1}, 0] - the last action plus a spare zero slot, so the actor can
-    # align to its single time step
+    # [a_{t-1}, 0] - past action plus spare slot for time alignment
 
     past_action = torch.zeros(num_envs, 2, 1) if use_last_action else None
 
     episode_rewards = torch.zeros(num_envs)
     episode_reward_list = []
 
-    obs_list, action_list, reward_list, value_list, log_prob_list, done_list, mask_list = ([] for _ in range(7))
+    obs_list, action_list, reward_list, value_list, log_prob_list, done_list, mask_list, trunc_value_list = ([] for _ in range(8))
 
     for _ in range(steps_per_iter):
         active = torch.from_numpy(env.active_mask).bool()
 
-        # store the pre-step obs, so every transition stays aligned:
-        # (s_t, a_t, log pi(a_t | s_t), V(s_t))
+        # keep (s_t, a_t, log prob, value) aligned
 
         obs_before = obs
 
@@ -150,8 +132,7 @@ def collect_trajectory(
 
         done = terminated | truncated
 
-        # envs that finish are reset only once all are done, so their later steps
-        # are garbage; only envs that were running before the step count
+        # finished envs wait for all-done reset, so ignore their steps
 
         reward = reward * active
 
@@ -164,6 +145,18 @@ def collect_trajectory(
         log_prob_list.append(log_prob)
         done_list.append(done)
         mask_list.append(active)
+
+        # value at episode end, so gae bootstraps through the time limit
+
+        trunc_value = torch.zeros(num_envs)
+
+        if (done & active).any():
+            with torch.no_grad():
+                final_value, _ = agent.forward_critic(dict(obs = rearrange(obs, 'b d -> b 1 d')))
+
+            trunc_value = rearrange(final_value, 'b 1 -> b') * (done & active).float()
+
+        trunc_value_list.append(trunc_value)
 
         episode_rewards += reward
 
@@ -195,6 +188,7 @@ def collect_trajectory(
         log_probs = cat([lp.unsqueeze(1) for lp in log_prob_list], dim = 1),
         dones = cat([d.unsqueeze(1) for d in done_list], dim = 1),
         mask = cat([m.unsqueeze(1) for m in mask_list], dim = 1),
+        trunc_values = cat([t.unsqueeze(1) for t in trunc_value_list], dim = 1),
         episode_rewards = episode_reward_list
     )
 
@@ -210,6 +204,10 @@ def compute_gae(
     rewards = rollout['rewards']
     values = rollout['values']
     masks = 1. - rollout['dones'].float()
+
+    # fold terminal value into reward, else episode ends teach zero targets
+
+    rewards = rewards + gamma * rollout['trunc_values']
 
     returns = agent.calc_gae(rewards, values, masks, gamma = gamma, lam = gae_lambda)
 
@@ -243,8 +241,7 @@ def ppo_update(
 
         make_batches = lambda: iter(DataLoader(TensorDataset(obs, actions, log_probs, advantages, returns, mask), batch_size = batch_size, shuffle = True))
     else:
-        # keep the time dimension, batching over contiguous time blocks, so the
-        # next latent prediction pairs stay aligned
+        # keep time dim, batch over contiguous blocks
 
         chunk = max(1, batch_size // obs.shape[0])
         tensors = tuple(t[:, :t.shape[1] // chunk * chunk].reshape(*t.shape[:1], -1, chunk, *t.shape[2:]) for t in (obs, actions, log_probs, advantages, returns, mask))
@@ -277,8 +274,7 @@ def ppo_update(
             clip_grad_norm_(agent.parameters(), max_grad_norm)
             optimizer.step()
 
-# deterministic evaluation - the mean episode reward of the current policy,
-# collected without exploration noise, for a stable view of learning
+# deterministic eval - mean episode reward, no exploration noise
 
 def evaluate(
     agent,
@@ -345,7 +341,7 @@ def evaluate(
 # main
 
 def main(
-    env_id = 'CartPole-v1', # gymnasium env id, 'isaacgym' for the mock isaac env, or 'module:attr' for any env factory
+    env_id = 'Pendulum-v1', # gymnasium env id, or 'module:attr' for any env factory
     num_envs = 1, # parallel envs (gymnasium vectorization); use more for faster data collection
     seed = 42,
     lr = 1.5e-4,
@@ -356,16 +352,17 @@ def main(
     batch_size = 64,
     entropy_weight = 0.005,
     max_grad_norm = 0.5,
-    min_reward = 100.,
+    min_reward = -250., # balanced policy reward over a 200 step episode; random torque sits around -1200
     max_iterations = 300,
     eval_every = 0, # evaluate the deterministic policy every N iterations (0 to disable)
     hl_gauss = True,
-    symlog = False,
+    min_value = -1300., # hl-gauss value support: pendulum episode returns span ~[-1200, 0]
+    max_value = 0.,
     min_conc = 0.,
-    obs_scale = (2.4, 3., 0.5, 4.),
-    next_latent_prediction = False, # spr / nlp next latent prediction on the actor's action head
+    obs_scale = (1., 1., 4.), # cos(theta), sin(theta) in [-1, 1], theta dot in [-8, 8]
+    next_latent_prediction = False, # next latent prediction on the actor's action head
     next_latent_prediction_weight = 1.,
-    use_rnn = True, # recurrent student, as in the paper; hidden states are threaded through rollouts
+    use_rnn = True, # recurrent student; hidden states threaded through rollouts
     actor_sees_past_action = False # condition the actor on the very past action (--actor-sees-past-action)
 ):
     torch.manual_seed(seed)
@@ -376,12 +373,7 @@ def main(
     obs, _ = reset_env(env, seed = seed)
     obs_dim = obs.shape[-1]
 
-    # num_actions resolved from the env's action space (unbatched)
-
-    if hasattr(env.action_space, 'n'):
-        num_actions = 1
-    else:
-        num_actions = env.action_space.shape[0]
+    num_actions = env.action_space.shape[0]
 
     preprocess = build_preprocess(tensor(obs_scale) if obs_scale is not None else None)
 
@@ -402,17 +394,16 @@ def main(
         state_encoder = StateEncoder(64, dim_state = obs_dim, num_stacked_frames = 1),
         depth = 2,
         use_regression = not hl_gauss,
-        min_value = -5.,
-        max_value = 505.,
-        num_bins = 256,
-        use_symlog = symlog
+        min_value = min_value,
+        max_value = max_value,
+        num_bins = 256
     )
 
     agent = Agent(actor, critic)
 
     optimizer = AdamW(agent.parameters(), lr = lr)
 
-    max_steps = getattr(getattr(env, 'spec', None), 'max_episode_steps', None) or getattr(env, 'max_steps', 500)
+    max_steps = getattr(getattr(env, 'spec', None), 'max_episode_steps', None) or getattr(env, 'max_steps', 200)
     episode_rewards = deque(maxlen = 10)
 
     print(f'training on {env_id} | {env.num_envs} parallel envs | {num_actions} action(s) | obs dim {obs_dim} | past action feedback {actor_sees_past_action}')
@@ -455,7 +446,7 @@ def main(
             print(f'evaluation | deterministic avg episode reward {evaluate(agent, env, preprocess, use_last_action = actor_sees_past_action):7.2f}')
 
         if avg_reward > min_reward:
-            print(f'balanced cartpole for {avg_reward:.2f} / {max_steps} steps at iteration {iteration}')
+            print(f'balanced inverted pendulum for {avg_reward:.2f} / {max_steps} steps at iteration {iteration}')
             break
 
 if __name__ == '__main__':
