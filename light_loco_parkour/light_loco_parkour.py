@@ -141,89 +141,9 @@ class Gaussian(ActionDistr):
 
         return Normal(mean, std)
 
-# beta distribution policy - unimodal mean-concentration reparameterization on (-1, 1),
-# an affine shift of a unit-interval beta (y = 2x - 1)
+# beta distribution policy - unimodal mean-concentration reparameterization on (-1, 1)
 
-class Beta(ActionDistr):
-    def __init__(
-        self,
-        pos_fn = 'softplus',
-        init_conc = 10.,
-        min_conc = 0.,
-        eps = 1e-5
-    ):
-        super().__init__()
-        assert pos_fn in ('exp', 'softplus')
-        assert init_conc > min_conc, 'init_conc must be greater than min_conc (the concentration floor)'
-
-        self.pos_fn = pos_fn
-        self.init_conc = init_conc
-        self.min_conc = min_conc
-        self.eps = eps
-
-        # raw offset into the positive fn so the concentration at raw_conc = 0 is exactly init_conc
-
-        self.raw_init_conc = math.log(math.expm1(init_conc - min_conc)) if pos_fn == 'softplus' else math.log(init_conc - min_conc)
-
-    def concentration(
-        self,
-        raw_conc
-    ):
-        if self.pos_fn == 'softplus':
-            return F.softplus(raw_conc + self.raw_init_conc) + self.min_conc
-        elif self.pos_fn == 'exp':
-            return (raw_conc + self.raw_init_conc).exp() + self.min_conc
-
-    def mean(
-        self,
-        params
-    ):
-        raw_mean, _ = params.unbind(dim = -1)
-        return raw_mean.tanh().clamp(min = -1. + self.eps, max = 1. - self.eps)
-
-    def entropy(
-        self,
-        params_or_dist,
-        sum_action_dim = True
-    ):
-        # shifted beta entropy = base entropy + log(2), the affine jacobian
-
-        dist = self.to_dist(params_or_dist)
-        entropy = dist.base_dist.entropy() + math.log(2.)
-        return entropy.sum(dim = -1) if sum_action_dim else entropy
-
-    def log_prob(
-        self,
-        params_or_dist,
-        action,
-        sum_action_dim = True,
-        eps = None
-    ):
-        eps = default(eps, self.eps)
-        action = action.clamp(min = -1. + eps, max = 1. - eps)
-        dist = self.to_dist(params_or_dist)
-        log_prob = dist.log_prob(action)
-        return log_prob.sum(dim = -1) if sum_action_dim else log_prob
-
-    def forward(self, params):
-        _, raw_conc = params.unbind(dim = -1)
-
-        # map (-1, 1) mean onto the unit interval
-
-        mean = self.mean(params)
-        m = (mean + 1.) / 2.
-
-        conc = self.concentration(raw_conc)
-
-        # keep the beta unimodal without changing its mean
-
-        min_m = torch.minimum(m, 1. - m).clamp(min = self.eps / 2.)
-        conc = conc + 1. / min_m
-
-        alpha = m * conc
-        beta = (1. - m) * conc
-
-        return TransformedDistribution(_Beta(alpha, beta), AffineTransform(loc = -1., scale = 2.))
+from mean_conc_beta import Beta
 
 # one hot helper module
 
@@ -501,7 +421,7 @@ class Actor(Module):
         self.backbone = create_mlp(dim, dim_in = self.skill_cond.dim_cond + dim, depth = depth)
 
         action_distr = default(action_distr, distr)
-        assert not exists(action_distr) or isinstance(action_distr, ActionDistr), 'action_distr must subclass ActionDistr (entropy / log_prob / forward contract)'
+        assert not exists(action_distr) or isinstance(action_distr, (ActionDistr, Beta)), 'action_distr must subclass ActionDistr or Beta (entropy / log_prob / forward contract)'
         self.action_distr = action_distr
         self.distr_dim_out = distr_dim_out
 
