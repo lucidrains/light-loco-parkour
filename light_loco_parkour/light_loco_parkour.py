@@ -516,7 +516,7 @@ class Actor(Module):
 
         time_encoded_states = self.maybe_add_action_history(time_encoded_states, past_actions)
 
-        batch, time, _ = shape(time_encoded_states, 'b t ...')
+        batch, time, *_ = shape(time_encoded_states, 'b t ...')
 
         maybe_one_hot = self.skill_cond(
             skill_groups,
@@ -633,7 +633,7 @@ class Critic(Module):
     ):
         time_encoded_states, next_time_hiddens = self.state_encoder(states, time_hiddens)
 
-        batch, time, _ = shape(time_encoded_states, 'b t ...')
+        batch, time, *_ = shape(time_encoded_states, 'b t ...')
 
         maybe_one_hot = self.skill_cond(
             skill_groups,
